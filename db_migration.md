@@ -1,3 +1,610 @@
+
+Below is a simple C# Windows Forms design for your SQLite-to-SQL Server data transfer application.
+
+The form allows the user to:
+
+1. Browse and select a `.db` file.
+2. Click Import to start importing tables and data into SQL Server.
+3. View real-time import activities in a multiline text area.
+4. See the import status when the operation completes.
+
+## 1. Form layout
+
+SQLite to SQL Server Import
+
+SQLITE DATABASE FILE
+
+Select a .db file...
+
+Browse
+
+Ready
+
+Import
+
+Import Activities
+
+21:45:01
+
+Ready to import.
+
+21:45:05
+
+SQLite database selected.
+
+21:45:08
+
+Connecting to SQL Server...
+
+21:45:09
+
+Discovering SQLite tables...
+
+21:45:10
+
+Importing tables and data...
+
+Import progress
+
+Waiting
+
+## 2. Windows Forms implementation
+
+Assumptions:
+
+- C# Windows Forms.
+- SQLite source database.
+- SQL Server destination configured in `App.config`.
+- Your existing `DataTransferEngine` performs the actual table and data transfer.
+
+Install these NuGet packages if they are not already installed:
+
+```
+Install-Package Microsoft.Data.Sqlite
+Install-Package Microsoft.Data.SqlClient
+```
+
+### MainForm.cs
+
+```
+using System;
+using System.IO;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace DataTransferApp
+{
+    public partial class MainForm : Form
+    {
+        private TextBox txtDatabaseFile;
+        private Button btnBrowse;
+        private Button btnImport;
+        private TextBox txtActivities;
+        private ProgressBar progressBar;
+        private Label lblStatus;
+
+        public MainForm()
+        {
+            InitializeComponent();
+            CreateForm();
+        }
+
+        private void CreateForm()
+        {
+            Text = "SQLite to SQL Server Import";
+            Width = 850;
+            Height = 600;
+            StartPosition = FormStartPosition.CenterScreen;
+
+            Label lblDatabase = new Label
+            {
+                Text = "SQLite Database File:",
+                Left = 20,
+                Top = 25,
+                Width = 200
+            };
+
+            txtDatabaseFile = new TextBox
+            {
+                Left = 20,
+                Top = 55,
+                Width = 650,
+                ReadOnly = true
+            };
+
+            btnBrowse = new Button
+            {
+                Text = "Browse",
+                Left = 680,
+                Top = 53,
+                Width = 120
+            };
+
+            btnBrowse.Click += BtnBrowse_Click;
+
+            btnImport = new Button
+            {
+                Text = "Import",
+                Left = 680,
+                Top = 95,
+                Width = 120,
+                Height = 35
+            };
+
+            btnImport.Click += BtnImport_Click;
+
+            Label lblActivities = new Label
+            {
+                Text = "Import Activities:",
+                Left = 20,
+                Top = 145,
+                Width = 200
+            };
+
+            txtActivities = new TextBox
+            {
+                Left = 20,
+                Top = 175,
+                Width = 780,
+                Height = 320,
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical,
+                WordWrap = false
+            };
+
+            progressBar = new ProgressBar
+            {
+                Left = 20,
+                Top = 520,
+                Width = 780,
+                Height = 18
+            };
+
+            lblStatus = new Label
+            {
+                Left = 20,
+                Top = 500,
+                Width = 780,
+                Text = "Ready"
+            };
+
+            Controls.Add(lblDatabase);
+            Controls.Add(txtDatabaseFile);
+            Controls.Add(btnBrowse);
+            Controls.Add(btnImport);
+            Controls.Add(lblActivities);
+            Controls.Add(txtActivities);
+            Controls.Add(progressBar);
+            Controls.Add(lblStatus);
+        }
+
+        private void BtnBrowse_Click(object sender, EventArgs e)
+        {
+            using (OpenFileDialog dialog = new OpenFileDialog())
+            {
+                dialog.Title = "Select SQLite Database";
+                dialog.Filter =
+                    "SQLite Database (*.db)|*.db|" +
+                    "All Files (*.*)|*.*";
+
+                dialog.CheckFileExists = true;
+                dialog.Multiselect = false;
+
+                if (dialog.ShowDialog() == DialogResult.OK)
+                {
+                    txtDatabaseFile.Text = dialog.FileName;
+
+                    LogActivity("Selected database: " +
+                                dialog.FileName);
+                }
+            }
+        }
+
+        private async void BtnImport_Click(object sender, EventArgs e)
+        {
+            string databaseFile = txtDatabaseFile.Text.Trim();
+
+            if (string.IsNullOrWhiteSpace(databaseFile) ||
+                !File.Exists(databaseFile))
+            {
+                MessageBox.Show(
+                    "Please select a valid SQLite database file.",
+                    "Database Required",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+
+                return;
+            }
+
+            btnImport.Enabled = false;
+            btnBrowse.Enabled = false;
+
+            progressBar.Style = ProgressBarStyle.Marquee;
+            lblStatus.Text = "Importing...";
+
+            LogActivity("================================");
+            LogActivity("Starting database import...");
+            LogActivity("================================");
+
+            try
+            {
+                var progress = new Progress<string>(message =>
+                {
+                    LogActivity(message);
+                });
+
+                await Task.Run(() =>
+                {
+                    // Connect this to your existing transfer engine.
+                    var engine = new DataTransferEngine();
+
+                    engine.ImportDatabase(
+                        databaseFile,
+                        progress);
+                });
+
+                LogActivity("================================");
+                LogActivity("Import completed successfully.");
+                LogActivity("================================");
+
+                lblStatus.Text = "Import completed successfully.";
+
+                MessageBox.Show(
+                    "Database import completed successfully.",
+                    "Import Complete",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                LogActivity("ERROR: " + ex.Message);
+
+                lblStatus.Text = "Import failed.";
+
+                MessageBox.Show(
+                    ex.Message,
+                    "Import Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            finally
+            {
+                progressBar.Style = ProgressBarStyle.Blocks;
+                progressBar.Value = 0;
+
+                btnImport.Enabled = true;
+                btnBrowse.Enabled = true;
+            }
+        }
+
+        private void LogActivity(string message)
+        {
+            if (txtActivities.InvokeRequired)
+            {
+                txtActivities.Invoke(
+                    new Action(() => LogActivity(message)));
+
+                return;
+            }
+
+            txtActivities.AppendText(
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] " +
+                message +
+                Environment.NewLine);
+        }
+    }
+}
+```
+
+## 3. Connect your existing DataTransferEngine
+
+Your transfer engine should expose a method similar to this:
+
+```
+using System;
+
+namespace DataTransferApp
+{
+    public class DataTransferEngine
+    {
+        public void ImportDatabase(
+            string databaseFile,
+            IProgress<string> progress)
+        {
+            progress?.Report("Opening SQLite database...");
+
+            // 1. Open SQLite database.
+
+            progress?.Report("Discovering SQLite tables...");
+
+            // 2. Discover tables, columns, primary keys,
+            //    unique keys, indexes and foreign keys.
+
+            progress?.Report("Loading transfer configuration...");
+
+            // 3. Load TransferConfig.xml.
+
+            progress?.Report("Connecting to SQL Server...");
+
+            // 4. Connect to SQL Server.
+
+            progress?.Report("Creating destination tables...");
+
+            // 5. Create SQL Server tables.
+
+            progress?.Report("Transferring table data...");
+
+            // 6. Transfer data in dependency order.
+
+            progress?.Report("Creating primary keys and indexes...");
+
+            // 7. Create primary keys, unique keys and indexes.
+
+            progress?.Report("Creating foreign keys...");
+
+            // 8. Create foreign key constraints.
+
+            progress?.Report("Validating imported data...");
+
+            // 9. Validate transfer.
+
+            progress?.Report("All operations completed.");
+        }
+    }
+}
+```
+
+The method above is an integration template. Connect each step to the implementation of your existing migration classes.
+
+## 4. Important design recommendations
+
+For your migration application, I recommend:
+
+- Keep the UI separate from the migration engine. The form should not contain SQL or SQLite migration logic.
+- Run the import in a background task so the application remains responsive.
+- Use `IProgress<string>` to report activities from the transfer engine.
+- Report individual table names, record counts, and errors in the activity window.
+- Do not create indexes and foreign keys until after data import, where appropriate.
+- Eventually replace the marquee progress indicator with actual progress based on tables and rows processed.
+
+Example of the activity output:
+
+```
+[2026-11-05 21:45:01] Starting database import...
+[2026-11-05 21:45:02] Opening SQLite database...
+[2026-11-05 21:45:03] Discovering SQLite tables...
+[2026-11-05 21:45:04] Found 12 tables.
+[2026-11-05 21:45:05] Connecting to SQL Server...
+[2026-11-05 21:45:06] Creating destination tables...
+[2026-11-05 21:45:08] Importing TestRunProperty...
+[2026-11-05 21:45:10] Imported 250 records.
+[2026-11-05 21:45:11] Importing MOSS_ConfigurationData1...
+[2026-11-05 21:45:14] Imported 1500 records.
+[2026-11-05 21:45:15] Creating primary keys...
+[2026-11-05 21:45:16] Creating indexes...
+[2026-11-05 21:45:17] Import completed successfully.
+```
+
+This gives you a clean separation: MainForm handles user interaction, while DataTransferEngine handles the complete SQLite-to-SQL Server migration.
+
+
+
+
+
+
+---
+
+
+
+The best approach is to use `IProgress<string>`. Pass it from `MainForm.cs` to `DataTransferEngine.cs`, and then pass it to other classes such as `SQLiteMetadataReader.cs`, `SQLServerSchemaBuilder.cs`, `DataTransferEngine.cs`, and `ConstraintBuilder.cs`.
+
+This way, any `.cs` file can report activities directly to the form's text area, without knowing anything about the UI.
+
+## 1. MainForm.cs
+
+Create a progress reporter and pass it to your migration engine.
+
+```
+private async void BtnImport_Click(object sender, EventArgs e)
+{
+    string databaseFile = txtDatabaseFile.Text.Trim();
+
+    if (!File.Exists(databaseFile))
+    {
+        MessageBox.Show("Please select a valid database file.");
+        return;
+    }
+
+    btnImport.Enabled = false;
+    btnBrowse.Enabled = false;
+
+    var progress = new Progress<string>(message =>
+    {
+        txtActivities.AppendText(
+            $"[{DateTime.Now:HH:mm:ss}] {message}" +
+            Environment.NewLine);
+    });
+
+    try
+    {
+        await Task.Run(() =>
+        {
+            var engine = new DataTransferEngine();
+
+            engine.ImportDatabase(databaseFile, progress);
+        });
+
+        lblStatus.Text = "Import completed successfully.";
+    }
+    catch (Exception ex)
+    {
+        progress.Report("ERROR: " + ex.Message);
+        lblStatus.Text = "Import failed.";
+    }
+    finally
+    {
+        btnImport.Enabled = true;
+        btnBrowse.Enabled = true;
+    }
+}
+```
+
+`Progress<string>` captures the UI synchronization context when created on the UI thread, so its callback can safely update the TextBox.
+
+## 2. DataTransferEngine.cs
+
+Accept the progress reporter and pass it to every component.
+
+```
+public class DataTransferEngine
+{
+    public void ImportDatabase(
+        string databaseFile,
+        IProgress<string> progress)
+    {
+        progress?.Report("Starting database import...");
+
+        var metadataReader = new SQLiteMetadataReader();
+
+        progress?.Report("Discovering SQLite tables...");
+
+        var metadata = metadataReader.ReadMetadata(
+            databaseFile,
+            progress);
+
+        var schemaBuilder = new SQLServerSchemaBuilder();
+
+        progress?.Report("Creating SQL Server tables...");
+
+        schemaBuilder.CreateTables(metadata, progress);
+
+        progress?.Report("Transferring data...");
+
+        // Your data transfer logic here.
+
+        progress?.Report("Creating constraints and indexes...");
+
+        var constraintBuilder = new ConstraintBuilder();
+
+        constraintBuilder.CreateConstraints(metadata, progress);
+
+        progress?.Report("Import completed.");
+    }
+}
+```
+
+## 3. SQLiteMetadataReader.cs
+
+The metadata reader can report its own activities.
+
+```
+public class SQLiteMetadataReader
+{
+    public DatabaseMetadata ReadMetadata(
+        string databaseFile,
+        IProgress<string> progress)
+    {
+        progress?.Report("Opening SQLite database...");
+
+        var metadata = new DatabaseMetadata();
+
+        // Read SQLite tables.
+
+        progress?.Report("Reading table structures...");
+
+        // Read columns and data types.
+
+        progress?.Report("Reading primary keys...");
+
+        // Read primary keys.
+
+        progress?.Report("Reading indexes and unique keys...");
+
+        // Read indexes.
+
+        progress?.Report("Reading foreign keys...");
+
+        // Read foreign keys.
+
+        progress?.Report("SQLite metadata discovery completed.");
+
+        return metadata;
+    }
+}
+```
+
+## 4. SQLServerSchemaBuilder.cs
+
+```
+public class SQLServerSchemaBuilder
+{
+    public void CreateTables(
+        DatabaseMetadata metadata,
+        IProgress<string> progress)
+    {
+        foreach (var table in metadata.Tables)
+        {
+            progress?.Report(
+                $"Creating SQL Server table: {table.Name}");
+
+            // Your existing CREATE TABLE logic.
+        }
+
+        progress?.Report("All destination tables created.");
+    }
+}
+```
+
+## 5. DataTransferEngine.cs: reporting individual table progress
+
+For data transfer, I recommend reporting record counts too.
+
+```
+progress?.Report($"Importing table: {tableName}");
+
+progress?.Report(
+    $"Table {tableName}: {recordsTransferred} records imported.");
+```
+
+## 6. Expected architecture
+
+MainForm.cs
+
+TextBox displays activities
+
+\*\*IProgress
+
+DataTransferEngine.cs
+
+Coordinates migration
+
+SQLiteMetadataReader.cs
+
+Report activity
+
+SQLServerSchemaBuilder.cs
+
+Report activity
+
+ConstraintBuilder.cs
+
+Report activity
+
+DataTransferEngine.cs
+
+Report activity
+
+My recommendation: Use `IProgress<string>` throughout your application. Avoid static variables, global event handlers, or direct references to `MainForm` from other classes. This keeps your migration engine reusable and independent of Windows Forms.
+
+You can later extend this design with a custom `ImportProgress` class containing activity type, table name, records processed, total records, and percentage complete. That will let you display both detailed logs and a real progress bar.
+
+
+
+
+
+
+---
 I would build this as a reusable metadata-driven SQLite-to-SQL Server Migration Engine in C#.
 
 The most important design decision is that your SQLite `.db` file remains the source of truth for the database schema. You should not have to manually define every table, column, or data type in the configuration file.
