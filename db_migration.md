@@ -1,3 +1,181 @@
+In C#, you can read the SQLite database schema directly by querying the built-in SQLite system table `sqlite_master` or by using SQLite's `PRAGMA` commands.
+
+I recommend using `PRAGMA` for detailed schema inspection.
+
+## 1. Install SQLite NuGet package
+
+For a .NET application, install:
+
+```
+dotnet add package Microsoft.Data.Sqlite
+```
+
+Add the namespace:
+
+```
+using Microsoft.Data.Sqlite;
+```
+
+## 2. Read all tables and views
+
+SQLite maintains database schema information in `sqlite_master`.
+
+```
+using Microsoft.Data.Sqlite;
+
+string connectionString = "Data Source=mydatabase.db";
+
+using var connection = new SqliteConnection(connectionString);
+connection.Open();
+
+string sql = @"
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_master
+    WHERE type IN ('table', 'view')
+    ORDER BY type, name;
+";
+
+using var command = new SqliteCommand(sql, connection);
+using var reader = command.ExecuteReader();
+
+while (reader.Read())
+{
+    Console.WriteLine($"Type: {reader["type"]}");
+    Console.WriteLine($"Name: {reader["name"]}");
+    Console.WriteLine($"Table: {reader["tbl_name"]}");
+    Console.WriteLine($"SQL: {reader["sql"]}");
+    Console.WriteLine("-----------------------------");
+}
+```
+
+This gives you the original `CREATE TABLE` and `CREATE VIEW` SQL statements.
+
+## 3. Read columns for a specific table
+
+Use `PRAGMA table_info()`.
+
+```
+string tableName = "students";
+
+using var command = new SqliteCommand(
+    $"PRAGMA table_info('{tableName}');",
+    connection);
+
+using var reader = command.ExecuteReader();
+
+while (reader.Read())
+{
+    Console.WriteLine(
+        $"Column: {reader["name"]}, " +
+        $"Type: {reader["type"]}, " +
+        $"NotNull: {reader["notnull"]}, " +
+        $"PrimaryKey: {reader["pk"]}, " +
+        $"Default: {reader["dflt_value"]}"
+    );
+}
+```
+
+Example output:
+
+```
+Column: id, Type: INTEGER, NotNull: 0, PrimaryKey: 1
+Column: name, Type: TEXT, NotNull: 1, PrimaryKey: 0
+Column: email, Type: TEXT, NotNull: 0, PrimaryKey: 0
+```
+
+## 4. Read foreign keys
+
+```
+using var command = new SqliteCommand(
+    "PRAGMA foreign_key_list('students');",
+    connection);
+
+using var reader = command.ExecuteReader();
+
+while (reader.Read())
+{
+    Console.WriteLine(
+        $"Table: {reader["table"]}, " +
+        $"From: {reader["from"]}, " +
+        $"To: {reader["to"]}"
+    );
+}
+```
+
+## 5. Read indexes
+
+```
+SELECT name, tbl_name, sql
+FROM sqlite_master
+WHERE type = 'index';
+```
+
+You can execute this query from C# just like the earlier examples.
+
+## 6. A reusable method to retrieve the entire schema
+
+If you want to inspect the database programmatically, this is a useful approach:
+
+```
+public static void ReadDatabaseSchema(string databasePath)
+{
+    using var connection = new SqliteConnection(
+        $"Data Source={databasePath}");
+
+    connection.Open();
+
+    string sql = @"
+        SELECT type, name, sql
+        FROM sqlite_master
+        WHERE sql IS NOT NULL
+        ORDER BY type, name;
+    ";
+
+    using var command = new SqliteCommand(sql, connection);
+    using var reader = command.ExecuteReader();
+
+    while (reader.Read())
+    {
+        Console.WriteLine($"\n[{reader["type"]}] {reader["name"]}");
+        Console.WriteLine(reader["sql"]);
+    }
+}
+```
+
+Usage:
+
+```
+ReadDatabaseSchema("/path/to/mydatabase.db");
+```
+
+### SQLite schema commands reference
+
+| Command                          | Purpose                           |
+| -------------------------------- | --------------------------------- |
+| `sqlite_master`                  | All database objects              |
+| `PRAGMA table_info(table)`       | Table columns                     |
+| `PRAGMA table_xinfo(table)`      | Includes hidden/generated columns |
+| `PRAGMA foreign_key_list(table)` | Foreign key relationships         |
+| `PRAGMA index_list(table)`       | Table indexes                     |
+| `PRAGMA index_info(index)`       | Index columns                     |
+| `PRAGMA integrity_check`         | Database integrity                |
+
+My recommendation: If your goal is to build a C# utility that automatically discovers the database structure (tables, columns, data types, primary keys, and foreign keys), use `sqlite_master` together with `PRAGMA table_info()` and `PRAGMA foreign_key_list()`.
+
+This will let you build a complete database schema representation dynamically without knowing the database structure in advance.
+
+
+---
+
+
+
+
+
+
+
+
+
+
 
 Below is a simple C# Windows Forms design for your SQLite-to-SQL Server data transfer application.
 
