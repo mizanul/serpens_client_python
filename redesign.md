@@ -1,3 +1,171 @@
+
+Yes. That is a valid observation, and it suggests the configuration should distinguish table relationships from table categories.
+
+In the proposed design:
+
+- A `RootTable` has no parent because it is associated directly with the `TestRun`.
+- A `ChildTable` has a parent because it depends on another aggregated table.
+- A `SingularTable` can also be a parent if another table needs to join to it.
+
+Therefore, I would not restrict parent relationships to `RootTables`. Instead, I recommend making the relationship model generic.
+
+## 1. Recommended configuration structure
+
+Use a common `Tables` collection with a `type` attribute to identify how each table is aggregated.
+
+```
+<Tables>
+    <!-- Associated directly with TestRun -->
+    <Table name="Student"
+           type="Root"
+           sourceTable="Student"
+           destinationTable="SDA_Student"
+           alias="s"
+           joinType="INNER"
+           joinCondition="s.StudentID = trp.StudentID">
+
+        <Columns>
+            <Column source="StudentID" destination="StudentID" />
+            <Column source="Name" destination="Name" />
+        </Columns>
+    </Table>
+
+    <!-- A standalone table, but it can be a parent -->
+    <Table name="TestRunProperty"
+           type="Singular"
+           sourceTable="TestRunProperty"
+           destinationTable="SDA_TestRunProperty"
+           keyColumns="TestRunPropertyID">
+
+        <Columns>
+            <Column source="TestRunPropertyID" destination="TestRunPropertyID" />
+            <Column source="TestRunID" destination="TestRunID" />
+        </Columns>
+    </Table>
+
+    <!-- Child of a singular table -->
+    <Table name="PropertyDetails"
+           type="Child"
+           sourceTable="PropertyDetails"
+           destinationTable="SDA_PropertyDetails"
+           parent="TestRunProperty"
+           alias="pd"
+           joinType="LEFT"
+           joinCondition="pd.TestRunPropertyID = trp.TestRunPropertyID">
+
+        <Columns>
+            <Column source="PropertyDetailID" destination="PropertyDetailID" />
+            <Column source="Description" destination="Description" />
+        </Columns>
+    </Table>
+
+    <!-- Child of a root table -->
+    <Table name="StudentDetails"
+           type="Child"
+           sourceTable="StudentDetails"
+           destinationTable="SDA_StudentDetails"
+           parent="Student"
+           alias="sd"
+           joinType="LEFT"
+           joinCondition="sd.StudentID = s.StudentID">
+
+        <Columns>
+            <Column source="StudentDetailID" destination="StudentDetailID" />
+            <Column source="Address" destination="Address" />
+        </Columns>
+    </Table>
+</Tables>
+```
+
+This is illustrative; the exact join conditions and key mappings must reflect your existing SQLite schema.
+
+## 2. How the aggregation engine should interpret it
+
+| Table type | Parent          | Aggregation behavior                                      |
+| ---------- | --------------- | --------------------------------------------------------- |
+| `Root`     | None            | Associated with the current TestRun                       |
+| `Singular` | None by default | Aggregated independently, usually associated with TestRun |
+| `Child`    | Required        | Aggregated using its parent's records                     |
+
+The important point is that a `Singular` table is not necessarily a leaf node. It can be a parent of one or more child tables.
+
+For example:
+
+\#chatgpt-mermaid-\_r_d86\_{font-family:-apple-system-body,ui-sans-serif,-apple-system,system-ui,"Segoe UI",Helvetica,"Apple Color Emoji",Arial,sans-serif,"Segoe UI Emoji","Segoe UI Symbol";font-size:16px;fill:rgb(13, 13, 13);}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#chatgpt-mermaid-\_r_d86\_ .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#chatgpt-mermaid-\_r_d86\_ .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#chatgpt-mermaid-\_r_d86\_ .error-icon{fill:rgb(243, 243, 243);}#chatgpt-mermaid-\_r_d86\_ .error-text{fill:rgb(13, 13, 13);stroke:rgb(13, 13, 13);}#chatgpt-mermaid-\_r_d86\_ .edge-thickness-normal{stroke-width:1px;}#chatgpt-mermaid-\_r_d86\_ .edge-thickness-thick{stroke-width:3.5px;}#chatgpt-mermaid-\_r_d86\_ .edge-pattern-solid{stroke-dasharray:0;}#chatgpt-mermaid-\_r_d86\_ .edge-thickness-invisible{stroke-width:0;fill:none;}#chatgpt-mermaid-\_r_d86\_ .edge-pattern-dashed{stroke-dasharray:3;}#chatgpt-mermaid-\_r_d86\_ .edge-pattern-dotted{stroke-dasharray:2;}#chatgpt-mermaid-\_r_d86\_ .marker{fill:rgb(143, 143, 143);stroke:rgb(143, 143, 143);}#chatgpt-mermaid-\_r_d86\_ .marker.cross{stroke:rgb(143, 143, 143);}#chatgpt-mermaid-\_r_d86\_ svg{font-family:-apple-system-body,ui-sans-serif,-apple-system,system-ui,"Segoe UI",Helvetica,"Apple Color Emoji",Arial,sans-serif,"Segoe UI Emoji","Segoe UI Symbol";font-size:16px;}#chatgpt-mermaid-\_r_d86\_ p{margin:0;}#chatgpt-mermaid-\_r_d86\_ .label{font-family:-apple-system-body,ui-sans-serif,-apple-system,system-ui,"Segoe UI",Helvetica,"Apple Color Emoji",Arial,sans-serif,"Segoe UI Emoji","Segoe UI Symbol";color:rgb(13, 13, 13);}#chatgpt-mermaid-\_r_d86\_ .cluster-label text{fill:rgb(13, 13, 13);}#chatgpt-mermaid-\_r_d86\_ .cluster-label span{color:rgb(13, 13, 13);}#chatgpt-mermaid-\_r_d86\_ .cluster-label span p{background-color:transparent;}#chatgpt-mermaid-\_r_d86\_ .label text,#chatgpt-mermaid-\_r_d86\_ span{fill:rgb(13, 13, 13);color:rgb(13, 13, 13);}#chatgpt-mermaid-\_r_d86\_ .node rect,#chatgpt-mermaid-\_r_d86\_ .node circle,#chatgpt-mermaid-\_r_d86\_ .node ellipse,#chatgpt-mermaid-\_r_d86\_ .node polygon,#chatgpt-mermaid-\_r_d86\_ .node path{fill:rgb(222, 234, 251);stroke:rgb(83, 154, 248);stroke-width:1px;}#chatgpt-mermaid-\_r_d86\_ .rough-node .label text,#chatgpt-mermaid-\_r_d86\_ .node .label text,#chatgpt-mermaid-\_r_d86\_ .image-shape .label,#chatgpt-mermaid-\_r_d86\_ .icon-shape .label{text-anchor:middle;}#chatgpt-mermaid-\_r_d86\_ .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#chatgpt-mermaid-\_r_d86\_ .rough-node .label,#chatgpt-mermaid-\_r_d86\_ .node .label,#chatgpt-mermaid-\_r_d86\_ .image-shape .label,#chatgpt-mermaid-\_r_d86\_ .icon-shape .label{text-align:center;}#chatgpt-mermaid-\_r_d86\_ .node.clickable{cursor:pointer;}#chatgpt-mermaid-\_r_d86\_ .root .anchor path{fill:rgb(143, 143, 143)!important;stroke-width:0;stroke:rgb(143, 143, 143);}#chatgpt-mermaid-\_r_d86\_ .arrowheadPath{fill:rgb(143, 143, 143);}#chatgpt-mermaid-\_r_d86\_ .edgePath .path{stroke:rgb(143, 143, 143);stroke-width:1px;}#chatgpt-mermaid-\_r_d86\_ .flowchart-link{stroke:rgb(143, 143, 143);fill:none;}#chatgpt-mermaid-\_r_d86\_ .edgeLabel{background-color:rgb(252, 252, 252);text-align:center;}#chatgpt-mermaid-\_r_d86\_ .edgeLabel p{background-color:rgb(252, 252, 252);}#chatgpt-mermaid-\_r_d86\_ .edgeLabel rect{opacity:0.5;background-color:rgb(252, 252, 252);fill:rgb(252, 252, 252);}#chatgpt-mermaid-\_r_d86\_ .labelBkg{background-color:rgba(252, 252, 252, 0.5);}#chatgpt-mermaid-\_r_d86\_ .cluster rect{fill:rgb(243, 243, 243);stroke:rgba(0, 0, 0, 0.1);stroke-width:1px;}#chatgpt-mermaid-\_r_d86\_ .cluster text{fill:rgb(13, 13, 13);}#chatgpt-mermaid-\_r_d86\_ .cluster span{color:rgb(13, 13, 13);}#chatgpt-mermaid-\_r_d86\_ div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system-body,ui-sans-serif,-apple-system,system-ui,"Segoe UI",Helvetica,"Apple Color Emoji",Arial,sans-serif,"Segoe UI Emoji","Segoe UI Symbol";font-size:12px;background:rgb(243, 243, 243);border:1px solid rgba(0, 0, 0, 0.1);border-radius:2px;pointer-events:none;z-index:100;}#chatgpt-mermaid-\_r_d86\_ .flowchartTitleText{text-anchor:middle;font-size:18px;fill:rgb(13, 13, 13);}#chatgpt-mermaid-\_r_d86\_ rect.text{fill:none;stroke-width:0;}#chatgpt-mermaid-\_r_d86\_ .icon-shape,#chatgpt-mermaid-\_r_d86\_ .image-shape{background-color:rgb(252, 252, 252);text-align:center;}#chatgpt-mermaid-\_r_d86\_ .icon-shape p,#chatgpt-mermaid-\_r_d86\_ .image-shape p{background-color:rgb(252, 252, 252);padding:2px;}#chatgpt-mermaid-\_r_d86\_ .icon-shape .label rect,#chatgpt-mermaid-\_r_d86\_ .image-shape .label rect{opacity:0.5;background-color:rgb(252, 252, 252);fill:rgb(252, 252, 252);}#chatgpt-mermaid-\_r_d86\_ .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#chatgpt-mermaid-\_r_d86\_ .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#chatgpt-mermaid-\_r_d86\_ .node .neo-node{stroke:rgb(83, 154, 248);}#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].node rect,#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].cluster rect,#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].node polygon{stroke:url(#chatgpt-mermaid-\_r_d86\_-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].swimlane.cluster rect{filter:none;}#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].node path{stroke:url(#chatgpt-mermaid-\_r_d86\_-gradient);stroke-width:1px;}#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].node .neo-line path{stroke:rgb(83, 154, 248);filter:none;}#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].node circle{stroke:url(#chatgpt-mermaid-\_r_d86\_-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].node circle .state-start{fill:#000000;}#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].icon-shape .icon{fill:url(#chatgpt-mermaid-\_r_d86\_-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#chatgpt-mermaid-\_r_d86\_ [data-look="neo"].icon-shape .icon-neo path{stroke:url(#chatgpt-mermaid-\_r_d86\_-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#chatgpt-mermaid-\_r_d86\_ .node text{font-size:14px;font-weight:600;letter-spacing:normal;fill:rgb(0, 79, 153);}#chatgpt-mermaid-\_r_d86\_ .edgeLabels text{font-size:13px;font-weight:600;letter-spacing:-0.08px;fill:rgb(0, 79, 153);}#chatgpt-mermaid-\_r_d86\_ .node tspan[font-weight="normal"],#chatgpt-mermaid-\_r_d86\_ .edgeLabels tspan[font-weight="normal"]{font-weight:600;}#chatgpt-mermaid-\_r_d86\_ .edgeLabel .label rect{opacity:1;rx:13px;ry:13px;fill:rgb(245, 250, 255);stroke:rgb(206, 219, 229);stroke-width:1px;}#chatgpt-mermaid-\_r_d86\_ .node rect,#chatgpt-mermaid-\_r_d86\_ .node circle,#chatgpt-mermaid-\_r_d86\_ .node ellipse,#chatgpt-mermaid-\_r_d86\_ .node polygon,#chatgpt-mermaid-\_r_d86\_ .node path{fill:rgb(229, 243, 255);stroke:rgba(0, 0, 0, 0.1);stroke-width:1px;}#chatgpt-mermaid-\_r_d86\_ .node rect{rx:16px;ry:16px;}#chatgpt-mermaid-\_r_d86\_ .mermaid-decision .label-container{fill:rgb(245, 250, 255);stroke:rgb(206, 219, 229);stroke-dasharray:2,2;}#chatgpt-mermaid-\_r_d86\_ .edgePaths .flowchart-link{stroke:rgb(143, 143, 143);stroke-width:1px;stroke-linecap:round;stroke-linejoin:round;}#chatgpt-mermaid-\_r_d86\_ .marker{fill:rgb(143, 143, 143);stroke:rgb(143, 143, 143);}#chatgpt-mermaid-\_r_d86\_ :root{--mermaid-font-family:-apple-system-body,ui-sans-serif,-apple-system,system-ui,"Segoe UI",Helvetica,"Apple Color Emoji",Arial,sans-serif,"Segoe UI Emoji","Segoe UI Symbol";}TestRunStudent - RootTestRunProperty - SingularStudentDetails - ChildPropertyDetails - Child
+
+## 3. Important design improvement: separate aggregation type from relationship
+
+I would actually take this one step further.
+
+Instead of using `type="Root"` or `type="Singular"` to determine whether a table can have children, use two independent concepts:
+
+- Aggregation type: How the table is processed (`Root`, `Singular`, or `Child`).
+- Parent relationship: Which table provides the parent records, if any.
+
+This avoids hardcoding the assumption that only root tables can be parents.
+
+For example, the C# model could be:
+
+```
+public class TableDefinition
+{
+    public string Name { get; set; }
+
+    public string AggregationType { get; set; }
+
+    public string SourceTable { get; set; }
+
+    public string DestinationTable { get; set; }
+
+    public string Parent { get; set; }
+
+    public string Alias { get; set; }
+
+    public string JoinType { get; set; }
+
+    public string JoinCondition { get; set; }
+
+    public List<string> KeyColumns { get; set; }
+
+    public List<ColumnMapping> Columns { get; set; }
+}
+```
+
+The aggregation engine should build a dependency graph from `Parent`, rather than assume a fixed hierarchy of Root → Child.
+
+## 4. My recommendation
+
+I would use this rule:
+
+Any aggregated table can be a parent of another aggregated table, regardless of whether it is classified as Root, Singular, or Child.
+
+This also allows deeper relationships:
+
+```
+TestRun
+  ├── Student (Root)
+  │     └── StudentDetails (Child)
+  │             └── StudentAddress (Child)
+  │
+  └── TestRunProperty (Singular)
+        └── PropertyDetails (Child)
+              └── PropertyMetadata (Child)
+```
+
+One additional consideration: a child should reference a stable parent key, and the aggregator must maintain a mapping between source primary keys and destination primary keys. Do not assume SQLite and SQL Server IDs are identical.
+
+This approach gives you a more scalable configuration without introducing unnecessary coupling between table types and their relationships.
+
+
+
+
+============================================
+============================================
+============================================
+
+
+
+
 Based on your lead's original direction, I would make a fairly significant improvement to this configuration. The current `app.config` has a good starting separation between test-run tables, root tables, and child tables, but it has one major architectural problem:
 
 It treats `TestRunProperty` as a special type of table, even though the lead wants it to be just one of several standalone (singular) tables that the aggregator can process.
