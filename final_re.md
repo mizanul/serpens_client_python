@@ -1,3 +1,728 @@
+
+
+
+
+
+
+Below is a complete configuration-driven design for your aggregator. It keeps your existing SQLite reader and `SQLServer.cs` implementation; it does not replace either one.
+
+The responsibilities are:
+
+- `app.config` defines source tables, destination tables, table types, parent relationships, keys, column mappings, and SQL Server join conditions.
+- `AggregatorConfig.cs` reads and validates the configuration.
+- `DataAggregator.cs` processes tables in parent-before-child order.
+- Your existing `SQLServer.cs` creates destination tables using the configured keys and `JoinConditions`, and handles data insertion/update.
+- Your existing SQLite class reads each source table into a `DataTable`.
+
+Importantly, the aggregator does not execute `JoinConditions` against SQLite data. They are passed to SQL Server table creation only.
+
+## 1. Complete app.config
+
+For a valid .NET Framework configuration file, declare the custom `aggregator` section under `configSections`. The `IgnoreSection` declaration allows us to keep the configuration as ordinary XML and read it using `XDocument`.
+
+The following is an illustrative configuration. Replace the sample column names and keys with those in your actual database.
+
+```
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+
+  <configSections>
+    <section
+      name="aggregator"
+      type="System.Configuration.IgnoreSection, System.Configuration"
+      allowLocation="true"
+      allowDefinition="Everywhere" />
+  </configSections>
+
+  <aggregator>
+
+    <Tables>
+
+      <!-- Property table -->
+      <Table
+        name="TestRunProperty"
+        type="Property"
+        sourceTable="TestRunProperty"
+        destinationTable="SDA_TestRunProperty"
+        primaryKey="PropertyID"
+        uniqueKey="PropertyID,TestRunID">
+
+        <Columns>
+          <Column source="PropertyID" />
+          <Column source="TestRunID" />
+          <Column source="PropertyName" />
+          <Column source="PropertyValue" />
+        </Columns>
+
+      </Table>
+
+
+      <!-- Root table: a Root is allowed to have a Property parent -->
+      <Table
+        name="MOSS"
+        type="Root"
+        sourceTable="MOSS_table"
+        destinationTable="SDA_MOSS"
+        parent="TestRunProperty"
+        primaryKey="MOSS_ID"
+        uniqueKey="MOSS_ID,TestRunID">
+
+        <JoinConditions operator="AND">
+          <Condition
+            parentColumn="PropertyID"
+            childColumn="PropertyID" />
+
+          <Condition
+            parentColumn="TestRunID"
+            childColumn="TestRunID" />
+        </JoinConditions>
+
+        <Columns>
+          <Column source="MOSS_ID" />
+          <Column source="PropertyID" />
+          <Column source="TestRunID" />
+          <Column source="MOSS_Name" destination="MOSS_Name" />
+        </Columns>
+
+      </Table>
+
+
+      <!-- Child table -->
+      <Table
+        name="MOSS_Child"
+        type="Child"
+        sourceTable="MOSS_Child_table"
+        destinationTable="SDA_MOSS_Child"
+        parent="MOSS"
+        primaryKey="Child_ID"
+        uniqueKey="Child_ID,TestRunID">
+
+        <JoinConditions operator="AND">
+          <Condition
+            parentColumn="MOSS_ID"
+            childColumn="MOSS_ID" />
+
+          <Condition
+            parentColumn="TestRunID"
+            childColumn="TestRunID" />
+        </JoinConditions>
+
+        <Columns>
+          <Column source="Child_ID" />
+          <Column source="MOSS_ID" />
+          <Column source="TestRunID" />
+          <Column source="Child_Name" />
+        </Columns>
+
+      </Table>
+
+
+      <!-- A Child table can also be the parent of another Child table -->
+      <Table
+        name="MOSS_Child_2"
+        type="Child"
+        sourceTable="MOSS_Child_table_2"
+        destinationTable="SDA_MOSS_Child_2"
+        parent="MOSS_Child"
+        primaryKey="Child2_ID"
+        uniqueKey="Child2_ID,TestRunID">
+
+        <JoinConditions operator="AND">
+          <Condition
+            parentColumn="Child_ID"
+            childColumn="Child_ID" />
+
+          <Condition
+            parentColumn="TestRunID"
+            childColumn="TestRunID" />
+        </JoinConditions>
+
+        <Columns>
+          <Column source="Child2_ID" />
+          <Column source="Child_ID" />
+          <Column source="TestRunID" />
+          <Column source="Description" />
+        </Columns>
+
+      </Table>
+
+    </Tables>
+
+  </aggregator>
+
+</configuration>
+```
+
+A few configuration rules:
+
+- `name` is the logical name used by the aggregator and by `parent`.
+- `sourceTable` is the SQLite table name.
+- `destinationTable` is the SQL Server table name.
+- `parent` is optional for `Property` and `Root`; it is required for `Child` in this example.
+- `JoinConditions` is optional. When present, it is passed to the SQL Server table-creation logic.
+- `primaryKey` and `uniqueKey` are metadata passed to your existing SQL Server implementation.
+- If a destination column has the same name as its source column, you can omit `destination`.
+
+## 2. C# configuration classes
+
+Create `AggregatorConfig.cs`.
+
+```
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.IO;
+using System.Linq;
+using System.Xml.Linq;
+
+namespace DataAggregator
+{
+    public enum TableType
+    {
+        Property,
+        Root,
+        Child
+    }
+
+    public class AggregatorConfig
+    {
+        public List<TableDefinition> Tables { get; set; }
+            = new List<TableDefinition>();
+
+        public static AggregatorConfig Load(string configPath)
+        {
+            if (!File.Exists(configPath))
+            {
+                throw new FileNotFoundException(
+                    "Aggregator configuration was not found.",
+                    configPath);
+            }
+
+            XDocument document = XDocument.Load(configPath);
+
+            XElement aggregatorElement =
+                document.Root?.Element("aggregator");
+
+            if (aggregatorElement == null)
+            {
+                throw new InvalidOperationException(
+                    "Missing <aggregator> configuration section.");
+            }
+
+            XElement tablesElement =
+                aggregatorElement.Element("Tables");
+
+            if (tablesElement == null)
+            {
+                throw new InvalidOperationException(
+                    "Missing <Tables> element.");
+            }
+
+            var config = new AggregatorConfig();
+
+            foreach (XElement element in tablesElement.Elements("Table"))
+            {
+                config.Tables.Add(ParseTable(element));
+            }
+
+            config.Validate();
+
+            return config;
+        }
+
+        private static TableDefinition ParseTable(XElement element)
+        {
+            string typeValue = (string)element.Attribute("type");
+
+            if (!Enum.TryParse(typeValue, true, out TableType tableType))
+            {
+                throw new InvalidOperationException(
+                    $"Invalid table type '{typeValue}'.");
+            }
+
+            var table = new TableDefinition
+            {
+                Name = RequiredAttribute(element, "name"),
+                Type = tableType,
+
+                SourceTable = RequiredAttribute(element, "sourceTable"),
+                DestinationTable = RequiredAttribute(element, "destinationTable"),
+
+                Parent = (string)element.Attribute("parent"),
+
+                PrimaryKey = (string)element.Attribute("primaryKey"),
+                UniqueKey = (string)element.Attribute("uniqueKey"),
+
+                JoinOperator = "AND"
+            };
+
+            XElement joinElement = element.Element("JoinConditions");
+
+            if (joinElement != null)
+            {
+                table.JoinOperator =
+                    ((string)joinElement.Attribute("operator") ?? "AND")
+                    .ToUpperInvariant();
+
+                foreach (XElement condition in joinElement.Elements("Condition"))
+                {
+                    table.JoinConditions.Add(new JoinCondition
+                    {
+                        ParentColumn = RequiredAttribute(
+                            condition, "parentColumn"),
+
+                        ChildColumn = RequiredAttribute(
+                            condition, "childColumn")
+                    });
+                }
+            }
+
+            XElement columnsElement = element.Element("Columns");
+
+            if (columnsElement != null)
+            {
+                foreach (XElement column in columnsElement.Elements("Column"))
+                {
+                    string source = RequiredAttribute(column, "source");
+
+                    table.Columns.Add(new ColumnMapping
+                    {
+                        Source = source,
+
+                        // If destination is omitted, use the source name.
+                        Destination =
+                            (string)column.Attribute("destination") ?? source
+                    });
+                }
+            }
+
+            return table;
+        }
+
+        private static string RequiredAttribute(
+            XElement element,
+            string attributeName)
+        {
+            string value = (string)element.Attribute(attributeName);
+
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new InvalidOperationException(
+                    $"Element <{element.Name}> requires attribute '{attributeName}'.");
+            }
+
+            return value;
+        }
+
+        public void Validate()
+        {
+            var names = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var table in Tables)
+            {
+                if (!names.Add(table.Name))
+                {
+                    throw new InvalidOperationException(
+                        $"Duplicate table definition: {table.Name}");
+                }
+
+                if (table.Type == TableType.Child &&
+                    string.IsNullOrWhiteSpace(table.Parent))
+                {
+                    throw new InvalidOperationException(
+                        $"Child table '{table.Name}' must define a parent.");
+                }
+
+                if (table.JoinOperator != "AND" &&
+                    table.JoinOperator != "OR")
+                {
+                    throw new InvalidOperationException(
+                        $"Invalid JoinConditions operator for '{table.Name}'.");
+                }
+
+                if (table.JoinConditions.Count > 0 &&
+                    string.IsNullOrWhiteSpace(table.Parent))
+                {
+                    throw new InvalidOperationException(
+                        $"Table '{table.Name}' defines JoinConditions but has no parent.");
+                }
+            }
+
+            foreach (var table in Tables)
+            {
+                if (!string.IsNullOrWhiteSpace(table.Parent))
+                {
+                    bool parentExists = Tables.Any(
+                        x => x.Name.Equals(
+                            table.Parent,
+                            StringComparison.OrdinalIgnoreCase));
+
+                    if (!parentExists)
+                    {
+                        throw new InvalidOperationException(
+                            $"Parent '{table.Parent}' for table " +
+                            $"'{table.Name}' was not defined.");
+                    }
+                }
+            }
+        }
+
+        public List<TableDefinition> GetTablesInDependencyOrder()
+        {
+            var ordered = new List<TableDefinition>();
+            var visited = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+
+            var visiting = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var table in Tables)
+            {
+                Visit(table, visited, visiting, ordered);
+            }
+
+            return ordered;
+        }
+
+        private void Visit(
+            TableDefinition table,
+            HashSet<string> visited,
+            HashSet<string> visiting,
+            List<TableDefinition> ordered)
+        {
+            if (visited.Contains(table.Name))
+                return;
+
+            if (!visiting.Add(table.Name))
+            {
+                throw new InvalidOperationException(
+                    $"Circular table dependency detected at '{table.Name}'.");
+            }
+
+            if (!string.IsNullOrWhiteSpace(table.Parent))
+            {
+                TableDefinition parent = Tables.First(
+                    x => x.Name.Equals(
+                        table.Parent,
+                        StringComparison.OrdinalIgnoreCase));
+
+                Visit(parent, visited, visiting, ordered);
+            }
+
+            visiting.Remove(table.Name);
+            visited.Add(table.Name);
+            ordered.Add(table);
+        }
+    }
+
+    public class TableDefinition
+    {
+        public string Name { get; set; }
+
+        public TableType Type { get; set; }
+
+        public string SourceTable { get; set; }
+
+        public string DestinationTable { get; set; }
+
+        public string Parent { get; set; }
+
+        public string PrimaryKey { get; set; }
+
+        public string UniqueKey { get; set; }
+
+        public string JoinOperator { get; set; }
+
+        public List<JoinCondition> JoinConditions { get; set; }
+            = new List<JoinCondition>();
+
+        public List<ColumnMapping> Columns { get; set; }
+            = new List<ColumnMapping>();
+    }
+
+    public class JoinCondition
+    {
+        public string ParentColumn { get; set; }
+
+        public string ChildColumn { get; set; }
+    }
+
+    public class ColumnMapping
+    {
+        public string Source { get; set; }
+
+        public string Destination { get; set; }
+    }
+}
+```
+
+## 3. C# interfaces for your existing SQLite and SQL Server classes
+
+These interfaces define the small boundary between the aggregator and your existing implementations. They do not implement another database reader or writer.
+
+Add `DatabaseInterfaces.cs`:
+
+```
+using System.Data;
+
+namespace DataAggregator
+{
+    public interface ISqliteReader
+    {
+        DataTable GetTableData(string sourceTable);
+    }
+
+    public interface ISqlServerWriter
+    {
+        // Create the destination table using the supplied metadata.
+        void CreateTable(TableDefinition definition);
+
+        // Insert or update the supplied source data.
+        void InsertOrUpdateData(
+            TableDefinition definition,
+            DataTable data);
+    }
+}
+```
+
+Your existing classes can be connected through small adapter classes, or you can implement these interfaces directly in those classes if you prefer.
+
+For example, the SQL Server adapter should pass the following information to your existing table-creation method:
+
+| Configuration property | Purpose                                   |
+| ---------------------- | ----------------------------------------- |
+| `DestinationTable`     | SQL Server table name                     |
+| `PrimaryKey`           | Primary-key definition                    |
+| `UniqueKey`            | Unique-key definition                     |
+| `JoinConditions`       | Parent/child column relationship metadata |
+| `JoinOperator`         | `AND` or `OR`                             |
+| `Columns`              | Source-to-destination column mappings     |
+
+The actual method calls inside the adapter depend on the method signatures already present in your `SQLServer.cs`.
+
+## 4. DataAggregator.cs
+
+This is the main orchestration class. It reads each SQLite table and passes the data and table definition to SQL Server.
+
+```
+using System;
+using System.Collections.Generic;
+using System.Data;
+
+namespace DataAggregator
+{
+    public class DataAggregator
+    {
+        private readonly ISqliteReader _sqliteReader;
+        private readonly ISqlServerWriter _sqlServerWriter;
+        private readonly AggregatorConfig _config;
+
+        public DataAggregator(
+            ISqliteReader sqliteReader,
+            ISqlServerWriter sqlServerWriter,
+            AggregatorConfig config)
+        {
+            _sqliteReader = sqliteReader
+                ?? throw new ArgumentNullException(nameof(sqliteReader));
+
+            _sqlServerWriter = sqlServerWriter
+                ?? throw new ArgumentNullException(nameof(sqlServerWriter));
+
+            _config = config
+                ?? throw new ArgumentNullException(nameof(config));
+        }
+
+        public void Run()
+        {
+            List<TableDefinition> tables =
+                _config.GetTablesInDependencyOrder();
+
+            foreach (TableDefinition table in tables)
+            {
+                ProcessTable(table);
+            }
+        }
+
+        private void ProcessTable(TableDefinition table)
+        {
+            Console.WriteLine(
+                $"Processing {table.Name} " +
+                $"({table.Type})");
+
+            // 1. Read the source SQLite table.
+            DataTable data =
+                _sqliteReader.GetTableData(table.SourceTable);
+
+            if (data == null)
+            {
+                throw new InvalidOperationException(
+                    $"SQLite reader returned null for '{table.SourceTable}'.");
+            }
+
+            // 2. Create the destination SQL Server table.
+            //    JoinConditions are passed as metadata here.
+            _sqlServerWriter.CreateTable(table);
+
+            // 3. Insert or update the data.
+            //    No SQLite joins or filtering are performed here.
+            _sqlServerWriter.InsertOrUpdateData(table, data);
+
+            Console.WriteLine(
+                $"Completed {table.Name}: {data.Rows.Count} rows.");
+        }
+    }
+}
+```
+
+## 5. Starting the aggregator
+
+For example, your application entry point could look like this:
+
+```
+using System;
+using System.IO;
+
+namespace DataAggregator
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            try
+            {
+                string configPath =
+                    AppDomain.CurrentDomain.SetupInformation.ConfigurationFile;
+
+                AggregatorConfig config =
+                    AggregatorConfig.Load(configPath);
+
+                // Connect your existing implementations here.
+                ISqliteReader sqliteReader =
+                    CreateSqliteReader();
+
+                ISqlServerWriter sqlServerWriter =
+                    CreateSqlServerWriter();
+
+                var aggregator = new DataAggregator(
+                    sqliteReader,
+                    sqlServerWriter,
+                    config);
+
+                aggregator.Run();
+
+                Console.WriteLine("Aggregation completed.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    "Aggregation failed: " + ex);
+            }
+        }
+
+        private static ISqliteReader CreateSqliteReader()
+        {
+            // Return an adapter around your existing SQLite class.
+            throw new NotImplementedException(
+                "Connect your existing SQLite reader here.");
+        }
+
+        private static ISqlServerWriter CreateSqlServerWriter()
+        {
+            // Return an adapter around your existing SQLServer.cs class.
+            throw new NotImplementedException(
+                "Connect your existing SQL Server writer here.");
+        }
+    }
+}
+```
+
+The two factory methods are intentionally left for integration with your actual classes; I don't know their current constructors and method signatures, so I don't want to invent them.
+
+## 6. Example dependency order
+
+Even if the tables appear in a different order in `app.config`, the aggregator will process them according to their parent relationships.
+
+For the example configuration:
+
+TestRunProperty
+
+Property
+
+MOSS
+
+Root
+
+MOSS_Child
+
+Child
+
+MOSS_Child_2
+
+Child
+
+The resulting processing order is:
+
+```
+1. TestRunProperty
+2. MOSS
+3. MOSS_Child
+4. MOSS_Child_2
+```
+
+## 7. Important design decisions
+
+I recommend keeping these responsibilities separate:
+
+| Component               | Responsibility                             |
+| ----------------------- | ------------------------------------------ |
+| `app.config`            | Table definitions and relationships        |
+| `AggregatorConfig`      | Load and validate configuration            |
+| `DataAggregator`        | Determine processing order and orchestrate |
+| Existing SQLite class   | Read source tables                         |
+| Existing `SQLServer.cs` | Create tables and insert/update records    |
+
+One important point about `JoinConditions`: since the SQLite database has no foreign-key constraints, these conditions are logical metadata supplied by your configuration. They do not automatically create SQL Server foreign-key constraints. Your existing `SQLServer.cs` should decide how to use them during destination table creation.
+
+Also, the current orchestration intentionally reads the complete source `DataTable` for each table. It does not filter rows based on the parent relationship.
+
+## 8. What I need to make the integration exact
+
+The configuration parser and orchestration above establish the design. To give you the final code without placeholders, I need to see the existing method signatures from:
+
+1. Your SQLite class that reads a table into a `DataTable`.
+2. Your `SQLServer.cs` table-creation method.
+3. Your `SQLServer.cs` insert/update method.
+
+With those methods, I can connect the aggregator directly to your existing implementation without rewriting your database code.
+
+
+
+
+
+
+
+
+
+
+
+======================
+======================
+======================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I recommend correcting the design in one important way: do not make `Root`, `Singular`, and `Child` determine whether a table can be a parent. Those are aggregation categories; parent-child relationships are a separate concern.
 
 The corrected design below uses:
