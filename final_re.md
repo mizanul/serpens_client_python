@@ -701,7 +701,252 @@ With those methods, I can connect the aggregator directly to your existing imple
 
 
 
+======================
 
+
+You can generate this SQL dynamically in C# using your `TableDefinition` configuration. I recommend keeping this functionality inside your existing `SQLServer.cs` class.
+
+The process is:
+
+1. Create the destination columns.
+2. Create the primary key.
+3. Create the unique constraint.
+4. Create the foreign-key constraint using the configured parent and `JoinConditions`.
+5. Execute the generated `CREATE TABLE` statement.
+
+## 1. Example configuration
+
+Your `MOSS_Child` definition:
+
+```
+<Table
+    name="MOSS_Child"
+    type="Child"
+    sourceTable="MOSS_Child_table"
+    destinationTable="SDA_MOSS_Child"
+    parent="MOSS"
+    primaryKey="Child_ID"
+    uniqueKey="Child_ID,TestRunID">
+
+    <JoinConditions operator="AND">
+        <Condition parentColumn="MOSS_ID" childColumn="MOSS_ID" />
+        <Condition parentColumn="TestRunID" childColumn="TestRunID" />
+    </JoinConditions>
+
+    <Columns>
+        <Column source="Child_ID" />
+        <Column source="MOSS_ID" />
+        <Column source="TestRunID" />
+        <Column source="Child_Name" />
+    </Columns>
+</Table>
+```
+
+You also need column data types. I recommend adding a `type` attribute to each column:
+
+```
+<Columns>
+    <Column source="Child_ID" type="INT" nullable="false" />
+    <Column source="MOSS_ID" type="INT" nullable="false" />
+    <Column source="TestRunID" type="INT" nullable="false" />
+    <Column source="Child_Name" type="NVARCHAR(255)" nullable="true" />
+</Columns>
+```
+
+## 2. Update your C# model
+
+```
+public class ColumnMapping
+{
+    public string Source { get; set; }
+    public string Destination { get; set; }
+    public string DataType { get; set; }
+    public bool Nullable { get; set; }
+}
+```
+
+When parsing the XML:
+
+```
+table.Columns.Add(new ColumnMapping
+{
+    Source = RequiredAttribute(column, "source"),
+
+    Destination =
+        (string)column.Attribute("destination")
+        ?? (string)column.Attribute("source"),
+
+    DataType = RequiredAttribute(column, "type"),
+
+    Nullable = !string.Equals(
+        (string)column.Attribute("nullable"),
+        "false",
+        StringComparison.OrdinalIgnoreCase)
+});
+```
+
+## 3. Add table creation logic to SQLServer.cs
+
+Here is a generic implementation that generates the SQL statement.
+
+```
+using System;
+using System.Collections.Generic;
+using System.Data.SqlClient;
+using System.Linq;
+using System.Text;
+
+public void CreateTable(TableDefinition table,
+                        TableDefinition parentTable)
+{
+    var sql = new StringBuilder();
+
+    sql.AppendLine(
+        $"CREATE TABLE {QuoteIdentifier(table.DestinationTable)} (");
+
+    var definitions = new List<string>();
+
+    // 1. Columns
+    foreach (var column in table.Columns)
+    {
+        string definition =
+            $"{QuoteIdentifier(column.Destination)} " +
+            $"{column.DataType} " +
+            (column.Nullable ? "NULL" : "NOT NULL");
+
+        definitions.Add(definition);
+    }
+
+    // 2. Primary key
+    if (!string.IsNullOrWhiteSpace(table.PrimaryKey))
+    {
+        definitions.Add(
+            $"CONSTRAINT {QuoteIdentifier("PK_" + table.DestinationTable)} " +
+            $"PRIMARY KEY ({FormatColumns(table.PrimaryKey)})");
+    }
+
+    // 3. Unique key
+    if (!string.IsNullOrWhiteSpace(table.UniqueKey))
+    {
+        definitions.Add(
+            $"CONSTRAINT {QuoteIdentifier("UQ_" + table.DestinationTable)} " +
+            $"UNIQUE ({FormatColumns(table.UniqueKey)})");
+    }
+
+    // 4. Foreign key
+    if (parentTable != null &&
+        table.JoinConditions != null &&
+        table.JoinConditions.Count > 0)
+    {
+        string parentColumns = string.Join(", ",
+            table.JoinConditions.Select(
+                x => QuoteIdentifier(x.ParentColumn)));
+
+        string childColumns = string.Join(", ",
+            table.JoinConditions.Select(
+                x => QuoteIdentifier(x.ChildColumn)));
+
+        definitions.Add(
+            $"CONSTRAINT {QuoteIdentifier("FK_" + table.DestinationTable + "_" + parentTable.DestinationTable)} " +
+            $"FOREIGN KEY ({childColumns}) " +
+            $"REFERENCES {QuoteIdentifier(parentTable.DestinationTable)} " +
+            $"({parentColumns})");
+    }
+
+    sql.AppendLine(string.Join("," + Environment.NewLine, definitions));
+
+    sql.AppendLine(");");
+
+    using (var connection = new SqlConnection(_connectionString))
+    using (var command = new SqlCommand(sql.ToString(), connection))
+    {
+        connection.Open();
+        command.ExecuteNonQuery();
+    }
+}
+```
+
+Helper methods:
+
+```
+private string QuoteIdentifier(string name)
+{
+    if (string.IsNullOrWhiteSpace(name))
+        throw new ArgumentException("SQL identifier cannot be empty.");
+
+    return "[" + name.Replace("]", "]]") + "]";
+}
+
+private string FormatColumns(string columns)
+{
+    return string.Join(", ",
+        columns.Split(',')
+            .Select(x => QuoteIdentifier(x.Trim())));
+}
+```
+
+`_connectionString` represents your existing SQL Server connection string field.
+
+## 4. Call it from the aggregator
+
+The aggregator needs to find the parent definition and pass it to SQL Server.
+
+```
+foreach (var table in config.GetTablesInDependencyOrder())
+{
+    TableDefinition parentTable = null;
+
+    if (!string.IsNullOrWhiteSpace(table.Parent))
+    {
+        parentTable = config.Tables.FirstOrDefault(
+            x => x.Name.Equals(
+                table.Parent,
+                StringComparison.OrdinalIgnoreCase));
+    }
+
+    sqlServer.CreateTable(table, parentTable);
+
+    DataTable data =
+        sqliteReader.GetTableData(table.SourceTable);
+
+    sqlServer.InsertOrUpdateData(table, data);
+}
+```
+
+## 5. Important SQL Server consideration
+
+Your example has:
+
+```
+PRIMARY KEY (Child_ID),
+UNIQUE (Child_ID, TestRunID)
+```
+
+This is technically valid, but the unique constraint is redundant because `Child_ID` is already unique by itself.
+
+More importantly, for this foreign key:
+
+```
+FOREIGN KEY (MOSS_ID, TestRunID)
+REFERENCES SDA_MOSS (MOSS_ID, TestRunID)
+```
+
+SQL Server requires the parent table to have a matching primary key or unique constraint on `(MOSS_ID, TestRunID)`.
+
+For example:
+
+```
+CONSTRAINT UQ_SDA_MOSS
+    UNIQUE (MOSS_ID, TestRunID)
+```
+
+Also, the child and parent columns must have compatible data types.
+
+Recommended design
+
+Keep `CreateTable()` generic in `SQLServer.cs`. It should receive the table definition and parent definition, then generate the appropriate SQL. This lets you add another Root or Child table through configuration without writing another SQL creation method.
+
+One caution: If your existing SQLite database has no foreign keys and some parent/child data does not satisfy the relationship, SQL Server will reject the foreign-key creation or subsequent inserts. You should only generate a physical foreign key when the source data and destination schema satisfy that constraint.
 
 
 
