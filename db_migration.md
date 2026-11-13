@@ -1,3 +1,57 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Refactor so that the app.config is made scalable and less coupled and restrictive for testrunproperties and similarly singular tables (those that don't follow the message parent/child relationship):
+if appropriate, eliminate unnecessary abstractions in app.config regarding testrunproperties, i.e. if the name of something shouldn't need to change in the SDA, we don't need to make the name a configurable item.
+other singular tables that we want to add to aggregate should be able to specified in a a more scalable fashion and testrunproperties becomes just one of those tables 
+Though some tables like testrunproperties may be important to get some key information like primary keys that are used part of parsing.  This aspect should be considered when considering how to reduce the coupling and allowing for scalable specification in the app.config
+Update to add aggregation of the SUT SN
+Add ability to mine old data (when adding new tables/fields, the ability to run the aggregator adhoc or automatically triggered to process an old database, and update (not add a new run) the necessary tables/fields.  This design needs to align with the next part:
+An agent/script is written to comb through old test results databases to update the SDA database in the background.
+
+
+2 other things which I don't know if captured yet which should be next items:
+consider capturing CSC model and version more comprehensively and organized (this may affect performance and need to figure out best approach);  i.e. users like SW may want the all the CSCs easily usable and filterable.  BIT may want to care about just the high level 1 representative CSC
+the HIC code to description lookup needs to be redesigned.  Currently it is a singleton in the database that was made manually one time.  In reality every test run has a table that could be different from other test runs, i.e. overtime the code to description mapping could change.  This should really be made into an aggregated table with TestRunId used.
+
+
+
+
+---
+as we just discussed, at the same time as I expect tickets being assigned to have proper requirements so the scope is known, as a sr. principal engineer, when you are given a ticket that is lacking these details, but have had discussions about what the ask is, you should be updating the ticket to capture these requirements and the scope to reflect your understanding, and sharing that back as what you intend to execute on. This will allow us to operate much more efficiently as it will quickly highlight where ambiguity remains for anyone on the team and provides the opportunity to fill those gaps early in the design and/or development process. It also helps reinforce alignment across the team on what the expected end product is, and that you as the engineer that will be implementing the work have the proper understanding and context to complete this effectively.
+
+Thanks for the clarity on that. I am probably misunderstanding this structure a little, but it looks like 30 and 31 really should be children of 18. Overall I think this structure will be helpful. I am going to challenge you to think about how to define your requirements in a cascading manner. Such that you are defining what the requirements for STSSTT-13 to be considered done at a high level are, and then breaking that down into the lower level requirements for the stories contained within. Overall this is a shared responsibility. Once the requirements for the epic are defined, you will likely have stories where each story satisfies one requirement. So your definition of done for that story is that that feature works as intended. The sub requirements needed to meet that doesn't necessarily need to come from you. There may need to be a planning discussion to help set those, but this is something that would be best for individuals who will primarily be doing the work to fill out to reinforce understanding and identify remaining ambiguity
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 In C#, you can read the SQLite database schema directly by querying the built-in SQLite system table `sqlite_master` or by using SQLite's `PRAGMA` commands.
 
 I recommend using `PRAGMA` for detailed schema inspection.
