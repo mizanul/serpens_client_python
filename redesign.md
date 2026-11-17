@@ -739,3 +739,1076 @@ Keep responsibilities separated:
 | `DataImporter`        | Import data and handle identity mapping    |
 
 One important distinction: the code above updates your configuration model and validation. It does not yet implement the SQL Server table creation or the parent identity mapping. Those belong in `TableCreator` and `DataImporter`, respectively.
+
+
+
+---
+
+
+Below is a complete SQL Server table-creation implementation. It assumes:
+
+- Your SQLite data has already been loaded into a `DataSet`.
+- Each `DataTable` contains the source table's columns and rows.
+- Your `AggregatorConfig` contains the table definitions and constraints.
+- You want to create SQL Server tables with **column types, primary keys, identity columns, multiple unique keys, and foreign keys**.
+- You are not inserting data yet.
+
+The implementation uses the `DataColumn.DataType` property to determine SQL Server column types. You can override any inferred type in your configuration using `SqlType`.
+
+**Important:** A `DataTable` does not necessarily preserve the original SQLite declared column type. For example, SQLite `NUMERIC` might appear as a .NET `Decimal`. If you need a specific SQL Server type, set `SqlType` explicitly.
+
+## **1. Configuration models**
+
+Create `AggregatorConfig.cs`:
+
+```
+
+using System;
+using System.Collections.Generic;
+
+namespace DataAggregator
+{
+    public class AggregatorConfig
+    {
+        public List<TableDefinition> Tables { get; set; }
+            = new List<TableDefinition>();
+
+        public TableDefinition GetTable(string name)
+        {
+            return Tables.Find(t =>
+                string.Equals(t.Name, name,
+                    StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    public class TableDefinition
+    {
+        // Logical name used to identify this table in the configuration.
+        public string Name { get; set; }
+
+        // Name of the SQLite table / DataTable.
+        public string SourceTable { get; set; }
+
+        // SQL Server destination table.
+        // Can be "MyTable" or "dbo.MyTable".
+        public string DestinationTable { get; set; }
+
+        // Optional schema. Defaults to dbo.
+        public string Schema { get; set; } = "dbo";
+
+        // One or more destination column names.
+        public List<string> PrimaryKey { get; set; }
+            = new List<string>();
+
+        // True only when the single primary key is SQL IDENTITY.
+        public bool Identity { get; set; }
+
+        public List<UniqueKeyDefinition> UniqueKeys { get; set; }
+            = new List<UniqueKeyDefinition>();
+
+        // Optional parent table and relationship.
+        public string Parent { get; set; }
+
+        public List<JoinCondition> JoinConditions { get; set; }
+            = new List<JoinCondition>();
+
+        // Empty means use all source columns with their original names.
+        public List<ColumnMapping> Columns { get; set; }
+            = new List<ColumnMapping>();
+    }
+
+    public class UniqueKeyDefinition
+    {
+        public List<string> Columns { get; set; }
+            = new List<string>();
+    }
+
+    public class JoinCondition
+    {
+        public string ParentColumn { get; set; }
+        public string ChildColumn { get; set; }
+    }
+
+    public class ColumnMapping
+    {
+        public string Source { get; set; }
+        public string Destination { get; set; }
+
+        // Optional SQL Server type override.
+        // Examples: BIGINT, NVARCHAR(200), DECIMAL(18,2).
+        public string SqlType { get; set; }
+
+        // Null means use DataColumn.AllowDBNull.
+        public bool? Nullable { get; set; }
+    }
+}
+
+```
+
+## **2. SQL Server type mapper**
+
+Create `SqlTypeMapper.cs`.
+
+This maps the .NET types in your existing `DataTable` to SQL Server types. Explicit `SqlType` configuration takes priority over automatic mapping.
+
+```
+
+using System;
+using System.Data;
+
+namespace DataAggregator
+{
+    public static class SqlTypeMapper
+    {
+        public static string GetSqlType(
+            DataColumn dataColumn,
+            ColumnMapping mapping)
+        {
+            // Explicit configuration always takes priority.
+            if (!string.IsNullOrWhiteSpace(mapping?.SqlType))
+            {
+                ValidateSqlType(mapping.SqlType);
+                return mapping.SqlType;
+            }
+
+            Type type = dataColumn.DataType;
+
+            if (type == typeof(string))
+            {
+                int length = dataColumn.MaxLength;
+
+                if (length > 0 && length <= 4000)
+                    return $"NVARCHAR({length})";
+
+                return "NVARCHAR(MAX)";
+            }
+
+            if (type == typeof(long))
+                return "BIGINT";
+
+            if (type == typeof(int))
+                return "INT";
+
+            if (type == typeof(short))
+                return "SMALLINT";
+
+            if (type == typeof(byte))
+                return "TINYINT";
+
+            if (type == typeof(bool))
+                return "BIT";
+
+            if (type == typeof(decimal))
+                return "DECIMAL(18,4)";
+
+            if (type == typeof(double))
+                return "FLOAT";
+
+            if (type == typeof(float))
+                return "REAL";
+
+            if (type == typeof(DateTime))
+                return "DATETIME2";
+
+            if (type == typeof(DateTimeOffset))
+                return "DATETIMEOFFSET";
+
+            if (type == typeof(TimeSpan))
+                return "TIME";
+
+            if (type == typeof(Guid))
+                return "UNIQUEIDENTIFIER";
+
+            if (type == typeof(byte[]))
+                return "VARBINARY(MAX)";
+
+            if (type == typeof(char))
+                return "NCHAR(1)";
+
+            if (type.IsEnum)
+                return "INT";
+
+            throw new NotSupportedException(
+                $"Unsupported DataColumn type '{type.FullName}' " +
+                $"for column '{dataColumn.ColumnName}'. " +
+                "Specify SqlType in the configuration.");
+        }
+
+        private static void ValidateSqlType(string sqlType)
+        {
+            // Prevent arbitrary SQL fragments in the configured type.
+            string value = sqlType.Trim().ToUpperInvariant();
+
+            string[] allowed =
+            {
+                "BIGINT", "INT", "SMALLINT", "TINYINT", "BIT",
+                "FLOAT", "REAL", "DATE", "DATETIME",
+                "DATETIME2", "DATETIMEOFFSET", "TIME",
+                "UNIQUEIDENTIFIER", "MONEY", "SMALLMONEY",
+                "NVARCHAR(MAX)", "VARCHAR(MAX)",
+                "VARBINARY(MAX)"
+            };
+
+            foreach (string item in allowed)
+            {
+                if (value == item)
+                    return;
+            }
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(
+                value,
+                @"^(N?VARCHAR|N?CHAR)\([1-9][0-9]{0,3}\)$"))
+                return;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(
+                value,
+                @"^(DECIMAL|NUMERIC)\([1-9][0-9]?,[0-9]{1,2}\)$"))
+                return;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(
+                value,
+                @"^VARBINARY\([1-9][0-9]*\)$"))
+                return;
+
+            throw new InvalidOperationException(
+                $"Invalid or unsupported SQL type: {sqlType}");
+        }
+    }
+}
+
+```
+
+# Transfer Data from SQLite to MSSql  
+
+## **3. SQL Server table creator**
+
+Create `SqlServerTableCreator.cs`.
+
+This is the main implementation. It:
+
+1. Finds the corresponding `DataTable` for each configured source table.
+2. Builds SQL Server column definitions.
+3. Creates primary keys.
+4. Creates identity columns when configured.
+5. Creates all configured unique constraints.
+6. Creates foreign keys after all tables exist.
+7. Uses a transaction so a failure rolls back the table creation.
+8. Validates the configured relationships before creating the tables.
+
+```
+
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using Microsoft.Data.SqlClient;
+
+namespace DataAggregator
+{
+    public class SqlServerTableCreator
+    {
+        private readonly string _connectionString;
+
+        public SqlServerTableCreator(string connectionString)
+        {
+            _connectionString = connectionString;
+        }
+
+        public void CreateTables(
+            AggregatorConfig config,
+            DataSet sourceData)
+        {
+            if (config == null)
+                throw new ArgumentNullException(nameof(config));
+
+            if (sourceData == null)
+                throw new ArgumentNullException(nameof(sourceData));
+
+            if (config.Tables.Count == 0)
+                throw new InvalidOperationException(
+                    "No table definitions were configured.");
+
+            // Resolve DataTables and validate all definitions first.
+            var resolved = ResolveTables(config, sourceData);
+
+            ValidateConfiguration(config, resolved);
+
+            using (var connection =
+                new SqlConnection(_connectionString))
+            {
+                connection.Open();
+
+                using (SqlTransaction transaction =
+                    connection.BeginTransaction())
+                {
+                    try
+                    {
+                        // Create all destination tables first.
+                        foreach (var item in resolved)
+                        {
+                            CreateTable(
+                                connection,
+                                transaction,
+                                item.Definition,
+                                item.DataTable,
+                                item.Columns);
+                        }
+
+                        // Add foreign keys only after all tables exist.
+                        foreach (var item in resolved)
+                        {
+                            if (!string.IsNullOrWhiteSpace(
+                                    item.Definition.Parent) &&
+                                item.Definition.JoinConditions.Count > 0)
+                            {
+                                CreateForeignKey(
+                                    connection,
+                                    transaction,
+                                    config,
+                                    item.Definition);
+                            }
+                        }
+
+                        transaction.Commit();
+                    }
+                    catch
+                    {
+                        transaction.Rollback();
+                        throw;
+                    }
+                }
+            }
+        }
+
+        private class ResolvedTable
+        {
+            public TableDefinition Definition { get; set; }
+
+            public DataTable DataTable { get; set; }
+
+            public List<ResolvedColumn> Columns { get; set; }
+        }
+
+        private class ResolvedColumn
+        {
+            public string SourceName { get; set; }
+
+            public string DestinationName { get; set; }
+
+            public string SqlType { get; set; }
+
+            public bool AllowNull { get; set; }
+
+            public DataColumn DataColumn { get; set; }
+        }
+
+        private List<ResolvedTable> ResolveTables(
+            AggregatorConfig config,
+            DataSet sourceData)
+        {
+            var result = new List<ResolvedTable>();
+
+            foreach (TableDefinition definition in config.Tables)
+            {
+                if (string.IsNullOrWhiteSpace(definition.SourceTable))
+                    throw new InvalidOperationException(
+                        $"SourceTable is missing for '{definition.Name}'.");
+
+                if (string.IsNullOrWhiteSpace(definition.DestinationTable))
+                    throw new InvalidOperationException(
+                        $"DestinationTable is missing for '{definition.Name}'.");
+
+                if (!sourceData.Tables.Contains(definition.SourceTable))
+                    throw new InvalidOperationException(
+                        $"DataTable '{definition.SourceTable}' was not found.");
+
+                DataTable dataTable =
+                    sourceData.Tables[definition.SourceTable];
+
+                var columns = ResolveColumns(definition, dataTable);
+
+                result.Add(new ResolvedTable
+                {
+                    Definition = definition,
+                    DataTable = dataTable,
+                    Columns = columns
+                });
+            }
+
+            return result;
+        }
+
+        private List<ResolvedColumn> ResolveColumns(
+            TableDefinition definition,
+            DataTable dataTable)
+        {
+            var result = new List<ResolvedColumn>();
+
+            // If no column mapping exists, use every DataTable column.
+            if (definition.Columns == null ||
+                definition.Columns.Count == 0)
+            {
+                foreach (DataColumn dataColumn in dataTable.Columns)
+                {
+                    result.Add(new ResolvedColumn
+                    {
+                        SourceName = dataColumn.ColumnName,
+                        DestinationName = dataColumn.ColumnName,
+                        SqlType = SqlTypeMapper.GetSqlType(
+                            dataColumn, null),
+                        AllowNull = dataColumn.AllowDBNull,
+                        DataColumn = dataColumn
+                    });
+                }
+
+                return result;
+            }
+
+            foreach (ColumnMapping mapping in definition.Columns)
+            {
+                if (string.IsNullOrWhiteSpace(mapping.Source))
+                    throw new InvalidOperationException(
+                        $"A source column is missing in '{definition.Name}'.");
+
+                if (!dataTable.Columns.Contains(mapping.Source))
+                    throw new InvalidOperationException(
+                        $"Source column '{mapping.Source}' was not found " +
+                        $"in DataTable '{dataTable.TableName}'.");
+
+                DataColumn dataColumn =
+                    dataTable.Columns[mapping.Source];
+
+                string destination =
+                    string.IsNullOrWhiteSpace(mapping.Destination)
+                        ? mapping.Source
+                        : mapping.Destination;
+
+                result.Add(new ResolvedColumn
+                {
+                    SourceName = mapping.Source,
+                    DestinationName = destination,
+                    SqlType = SqlTypeMapper.GetSqlType(
+                        dataColumn, mapping),
+                    AllowNull = mapping.Nullable ??
+                                dataColumn.AllowDBNull,
+                    DataColumn = dataColumn
+                });
+            }
+
+            return result;
+        }
+
+        private void ValidateConfiguration(
+            AggregatorConfig config,
+            List<ResolvedTable> resolved)
+        {
+            foreach (ResolvedTable item in resolved)
+            {
+                TableDefinition table = item.Definition;
+
+                var destinationColumns = new HashSet<string>(
+                    item.Columns.Select(c => c.DestinationName),
+                    StringComparer.OrdinalIgnoreCase);
+
+                if (destinationColumns.Count != item.Columns.Count)
+                    throw new InvalidOperationException(
+                        $"Duplicate destination column mapping in '{table.Name}'.");
+
+                if (item.Columns.Count == 0)
+                    throw new InvalidOperationException(
+                        $"Table '{table.Name}' has no columns.");
+
+                ValidateKeyColumns(
+                    table.Name, "PrimaryKey",
+                    table.PrimaryKey, destinationColumns);
+
+                foreach (UniqueKeyDefinition uniqueKey in table.UniqueKeys)
+                {
+                    ValidateKeyColumns(
+                        table.Name, "UniqueKey",
+                        uniqueKey.Columns, destinationColumns);
+                }
+
+                if (table.Identity)
+                {
+                    if (table.PrimaryKey.Count != 1)
+                        throw new InvalidOperationException(
+                            $"Identity table '{table.Name}' must have " +
+                            "exactly one primary key column.");
+
+                    ResolvedColumn identityColumn =
+                        item.Columns.First(c =>
+                            c.DestinationName.Equals(
+                                table.PrimaryKey[0],
+                                StringComparison.OrdinalIgnoreCase));
+
+                    if (!new[] { "INT", "BIGINT", "SMALLINT", "TINYINT" }
+                        .Contains(identityColumn.SqlType.ToUpperInvariant()))
+                    {
+                        throw new InvalidOperationException(
+                            $"Identity column '{identityColumn.DestinationName}' " +
+                            "must use INT, BIGINT, SMALLINT or TINYINT.");
+                    }
+                }
+
+                if (table.JoinConditions.Count > 0)
+                {
+                    if (string.IsNullOrWhiteSpace(table.Parent))
+                        throw new InvalidOperationException(
+                            $"Table '{table.Name}' has JoinConditions " +
+                            "but no Parent.");
+
+                    TableDefinition parent =
+                        config.GetTable(table.Parent);
+
+                    if (parent == null)
+                        throw new InvalidOperationException(
+                            $"Parent '{table.Parent}' was not found.");
+
+                    foreach (JoinCondition condition in table.JoinConditions)
+                    {
+                        if (!destinationColumns.Contains(condition.ChildColumn))
+                            throw new InvalidOperationException(
+                                $"Foreign key child column " +
+                                $"'{condition.ChildColumn}' was not found " +
+                                $"in '{table.Name}'.");
+                    }
+
+                    ValidateParentKey(config, table, parent);
+                    ValidateForeignKeyTypes(
+                        config, resolved, table, parent);
+                }
+            }
+        }
+
+        private void ValidateKeyColumns(
+            string tableName,
+            string keyName,
+            List<string> columns,
+            HashSet<string> availableColumns)
+        {
+            if (columns == null || columns.Count == 0)
+                return;
+
+            foreach (string column in columns)
+            {
+                if (!availableColumns.Contains(column))
+                    throw new InvalidOperationException(
+                        $"{keyName} column '{column}' does not exist " +
+                        $"in table '{tableName}'.");
+            }
+        }
+
+        private void ValidateParentKey(
+            AggregatorConfig config,
+            TableDefinition child,
+            TableDefinition parent)
+        {
+            List<string> referencedColumns =
+                child.JoinConditions
+                    .Select(c => c.ParentColumn)
+                    .ToList();
+
+            // SQL Server foreign keys must reference a primary key
+            // or a unique key with the same columns in the same order.
+            bool matchesPrimary =
+                SameOrderedColumns(
+                    referencedColumns, parent.PrimaryKey);
+
+            bool matchesUnique = parent.UniqueKeys.Any(
+                key => SameOrderedColumns(
+                    referencedColumns, key.Columns));
+
+            if (!matchesPrimary && !matchesUnique)
+            {
+                throw new InvalidOperationException(
+                    $"Foreign key from '{child.Name}' to '{parent.Name}' " +
+                    "must reference the parent's primary key or one " +
+                    "of its unique keys, in the same column order.");
+            }
+        }
+
+        private bool SameOrderedColumns(
+            List<string> first,
+            List<string> second)
+        {
+            if (first == null || second == null)
+                return false;
+
+            if (first.Count != second.Count)
+                return false;
+
+            for (int i = 0; i < first.Count; i++)
+            {
+                if (!first[i].Equals(
+                    second[i],
+                    StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private void ValidateForeignKeyTypes(
+            AggregatorConfig config,
+            List<ResolvedTable> resolved,
+            TableDefinition child,
+            TableDefinition parent)
+        {
+            ResolvedTable childResolved =
+                resolved.First(x => x.Definition == child);
+
+            ResolvedTable parentResolved =
+                resolved.First(x => x.Definition == parent);
+
+            foreach (JoinCondition condition in child.JoinConditions)
+            {
+                ResolvedColumn childColumn =
+                    childResolved.Columns.First(c =>
+                        c.DestinationName.Equals(
+                            condition.ChildColumn,
+                            StringComparison.OrdinalIgnoreCase));
+
+                ResolvedColumn parentColumn =
+                    parentResolved.Columns.FirstOrDefault(c =>
+                        c.DestinationName.Equals(
+                            condition.ParentColumn,
+                            StringComparison.OrdinalIgnoreCase));
+
+                if (parentColumn == null)
+                    throw new InvalidOperationException(
+                        $"Parent column '{condition.ParentColumn}' " +
+                        $"was not found in '{parent.Name}'.");
+
+                if (!childColumn.SqlType.Equals(
+                    parentColumn.SqlType,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"Foreign key type mismatch: " +
+                        $"'{child.Name}.{condition.ChildColumn}' is " +
+                        $"{childColumn.SqlType}, but " +
+                        $"'{parent.Name}.{condition.ParentColumn}' is " +
+                        $"{parentColumn.SqlType}.");
+                }
+            }
+        }
+
+        private void CreateTable(
+            SqlConnection connection,
+            SqlTransaction transaction,
+            TableDefinition definition,
+            DataTable dataTable,
+            List<ResolvedColumn> columns)
+        {
+            string schema = GetSchema(definition);
+            string tableName = GetTableName(definition);
+
+            string qualifiedName =
+                $"{Quote(schema)}.{Quote(tableName)}";
+
+            string objectName = $"{schema}.{tableName}";
+
+            using (var check = new SqlCommand(
+                "SELECT OBJECT_ID(@name, 'U')",
+                connection,
+                transaction))
+            {
+                check.Parameters.AddWithValue("@name", objectName);
+
+                object existing = check.ExecuteScalar();
+
+                if (existing != null && existing != DBNull.Value)
+                    throw new InvalidOperationException(
+                        $"SQL Server table '{objectName}' already exists.");
+            }
+
+            var definitions = new List<string>();
+
+            foreach (ResolvedColumn column in columns)
+            {
+                bool isPrimaryKey =
+                    definition.PrimaryKey.Any(pk =>
+                        pk.Equals(
+                            column.DestinationName,
+                            StringComparison.OrdinalIgnoreCase));
+
+                string sql = $"{Quote(column.DestinationName)} " +
+                             column.SqlType;
+
+                if (definition.Identity && isPrimaryKey)
+                    sql += " IDENTITY(1,1)";
+
+                bool allowNull =
+                    isPrimaryKey ? false : column.AllowNull;
+
+                sql += allowNull ? " NULL" : " NOT NULL";
+
+                definitions.Add(sql);
+            }
+
+            // Primary key constraint.
+            if (definition.PrimaryKey.Count > 0)
+            {
+                string primaryColumns = string.Join(
+                    ", ",
+                    definition.PrimaryKey.Select(Quote));
+
+                definitions.Add(
+                    $"CONSTRAINT {Quote(ConstraintName("PK", tableName, "1"))} " +
+                    $"PRIMARY KEY ({primaryColumns})");
+            }
+
+            // Multiple unique constraints.
+            for (int i = 0; i < definition.UniqueKeys.Count; i++)
+            {
+                UniqueKeyDefinition unique =
+                    definition.UniqueKeys[i];
+
+                string uniqueColumns = string.Join(
+                    ", ",
+                    unique.Columns.Select(Quote));
+
+                definitions.Add(
+                    $"CONSTRAINT {Quote(ConstraintName("UQ", tableName, (i + 1).ToString()))} " +
+                    $"UNIQUE ({uniqueColumns})");
+            }
+
+            string sqlCreate =
+                $"CREATE TABLE {qualifiedName} (" +
+                string.Join(", ", definitions) +
+                ");";
+
+            using (var command = new SqlCommand(
+                sqlCreate, connection, transaction))
+            {
+                command.ExecuteNonQuery();
+            }
+        }
+
+        private void CreateForeignKey(
+            SqlConnection connection,
+            SqlTransaction transaction,
+            AggregatorConfig config,
+            TableDefinition child)
+        {
+            TableDefinition parent = config.GetTable(child.Parent);
+
+            string childSchema = GetSchema(child);
+            string childTable = GetTableName(child);
+
+            string parentSchema = GetSchema(parent);
+            string parentTable = GetTableName(parent);
+
+            string childColumns = string.Join(
+                ", ",
+                child.JoinConditions.Select(
+                    c => Quote(c.ChildColumn)));
+
+            string parentColumns = string.Join(
+                ", ",
+                child.JoinConditions.Select(
+                    c => Quote(c.ParentColumn)));
+
+            string constraintName = ConstraintName(
+                "FK",
+                childTable,
+                parentTable);
+
+            string sql =
+                $"ALTER TABLE {Quote(childSchema)}.{Quote(childTable)} " +
+                $"ADD CONSTRAINT {Quote(constraintName)} " +
+                $"FOREIGN KEY ({childColumns}) " +
+                $"REFERENCES {Quote(parentSchema)}.{Quote(parentTable)} " +
+                $"({parentColumns});";
+
+            using (var command = new SqlCommand(
+                sql, connection, transaction))
+            {
+                command.ExecuteNonQuery();
+            }
+        }
+
+        private string GetSchema(TableDefinition table)
+        {
+            string schema = string.IsNullOrWhiteSpace(table.Schema)
+                ? "dbo"
+                : table.Schema;
+
+            string destination = table.DestinationTable;
+
+            if (destination.Contains("."))
+            {
+                string[] parts = destination.Split('.');
+
+                if (parts.Length != 2)
+                    throw new InvalidOperationException(
+                        $"Invalid destination table name: {destination}");
+
+                schema = parts[0];
+            }
+
+            return schema;
+        }
+
+        private string GetTableName(TableDefinition table)
+        {
+            string destination = table.DestinationTable;
+
+            if (destination.Contains("."))
+            {
+                string[] parts = destination.Split('.');
+
+                if (parts.Length != 2)
+                    throw new InvalidOperationException(
+                        $"Invalid destination table name: {destination}");
+
+                return parts[1];
+            }
+
+            return destination;
+        }
+
+        private string Quote(string identifier)
+        {
+            if (string.IsNullOrWhiteSpace(identifier))
+                throw new InvalidOperationException(
+                    "SQL identifier cannot be empty.");
+
+            return "[" + identifier.Replace("]", "]]") + "]";
+        }
+
+        private string ConstraintName(
+            string prefix,
+            string table,
+            string suffix)
+        {
+            string name = $"{prefix}_{table}_{suffix}";
+
+            if (name.Length > 128)
+                name = name.Substring(0, 128);
+
+            return name;
+        }
+    }
+}
+
+```
+
+## **4. Example configuration**
+
+For example, suppose your SQLite `DataSet` contains these tables:
+
+- `TestRun`
+- `TestRunProperty`
+- `SUT`
+
+Your configuration can define their SQL Server relationships like this:
+
+```
+var config = new AggregatorConfig();
+
+config.Tables.Add(new TableDefinition
+{
+    Name = "TestRun",
+    SourceTable = "TestRun",
+    DestinationTable = "TestRun",
+    Schema = "dbo",
+
+    PrimaryKey = new List<string> { "TestRunID" },
+    Identity = true,
+
+    UniqueKeys = new List<UniqueKeyDefinition>
+    {
+        new UniqueKeyDefinition
+        {
+            Columns = new List<string> { "TestRunName" }
+        }
+    },
+
+    Columns = new List<ColumnMapping>
+    {
+        new ColumnMapping
+        {
+            Source = "TestRunID",
+            Destination = "TestRunID",
+            SqlType = "INT"
+        },
+        new ColumnMapping
+        {
+            Source = "TestRunName",
+            Destination = "TestRunName",
+            SqlType = "NVARCHAR(200)"
+        },
+        new ColumnMapping
+        {
+            Source = "StartDate",
+            Destination = "StartDate",
+            SqlType = "DATETIME2"
+        }
+    }
+});
+
+config.Tables.Add(new TableDefinition
+{
+    Name = "TestRunProperty",
+    SourceTable = "TestRunProperty",
+    DestinationTable = "TestRunProperty",
+    Schema = "dbo",
+
+    PrimaryKey = new List<string> { "PropertyID" },
+    Identity = true,
+
+    Parent = "TestRun",
+
+    JoinConditions = new List<JoinCondition>
+    {
+        new JoinCondition
+        {
+            ParentColumn = "TestRunID",
+            ChildColumn = "TestRunID"
+        }
+    },
+
+    UniqueKeys = new List<UniqueKeyDefinition>
+    {
+        new UniqueKeyDefinition
+        {
+            Columns = new List<string>
+            {
+                "PropertyName",
+                "TestRunID"
+            }
+        }
+    }
+});
+
+config.Tables.Add(new TableDefinition
+{
+    Name = "SUT",
+    SourceTable = "SUT",
+    DestinationTable = "SUT",
+    Schema = "dbo",
+
+    PrimaryKey = new List<string> { "SUTID" },
+    Identity = true,
+
+    // No parent or foreign key.
+});
+```
+
+The example explicitly overrides the types of `TestRun` columns. For `TestRunProperty` and `SUT`, the code automatically determines types from their `DataTable` columns.
+
+**One important detail:** The example assumes `TestRunProperty.TestRunID` and `TestRun.TestRunID` both resolve to `INT`. The child foreign key must use the same SQL type as the referenced parent column.
+
+## **5. Calling the table creator**
+
+Once your SQLite tables have already been loaded into a `DataSet`, call:
+
+```
+using System.Data;
+using DataAggregator;
+
+string connectionString =
+    @"Server=YOUR_SERVER;Database=YOUR_DATABASE;Trusted_Connection=True;TrustServerCertificate=True;";
+
+DataSet sourceData = GetYourExistingSQLiteDataSet();
+
+var creator = new SqlServerTableCreator(connectionString);
+
+creator.CreateTables(config, sourceData);
+```
+
+`GetYourExistingSQLiteDataSet()` represents your existing SQLite-loading code. You do not need to read SQLite again in the table creator.
+
+## **6. Two small additions to make it fully usable**
+
+**Create the destination schema if it does not exist.**
+
+Inside `CreateTable()`, immediately before the `OBJECT_ID` check, add:
+
+```
+using (var schemaCommand = new SqlCommand(
+    "IF SCHEMA_ID(@schema) IS NULL " +
+    "EXEC(N'CREATE SCHEMA ' + QUOTENAME(@schema));",
+    connection,
+    transaction))
+{
+    schemaCommand.Parameters.AddWithValue(
+        "@schema", schema);
+
+    schemaCommand.ExecuteNonQuery();
+}
+```
+
+This allows the creator to work with schemas other than `dbo` as well.
+
+**Install the SQL Server client package** if it is not already in your project:
+
+```
+Install-Package Microsoft.Data.SqlClient
+```
+
+Or, if your existing application uses `System.Data.SqlClient`, replace the `using Microsoft.Data.SqlClient;` statement with `using System.Data.SqlClient;`.
+
+## **7. Expected SQL Server result**
+
+For the example configuration, the generated database structure will conceptually look like this:
+
+```
+CREATE TABLE dbo.TestRun
+(
+    TestRunID INT IDENTITY(1,1) NOT NULL,
+    TestRunName NVARCHAR(200) NOT NULL,
+    StartDate DATETIME2 NULL,
+
+    CONSTRAINT PK_TestRun_1
+        PRIMARY KEY (TestRunID),
+
+    CONSTRAINT UQ_TestRun_1
+        UNIQUE (TestRunName)
+);
+
+CREATE TABLE dbo.TestRunProperty
+(
+    PropertyID INT IDENTITY(1,1) NOT NULL,
+    TestRunID INT NOT NULL,
+    PropertyName NVARCHAR(MAX) NULL,
+
+    CONSTRAINT PK_TestRunProperty_1
+        PRIMARY KEY (PropertyID),
+
+    CONSTRAINT UQ_TestRunProperty_1
+        UNIQUE (PropertyName, TestRunID),
+
+    CONSTRAINT FK_TestRunProperty_TestRun
+        FOREIGN KEY (TestRunID)
+        REFERENCES dbo.TestRun(TestRunID)
+);
+
+CREATE TABLE dbo.SUT
+(
+    SUTID INT IDENTITY(1,1) NOT NULL
+
+    -- Other columns are generated from its DataTable.
+);
+```
+
+The actual generated column definitions depend on the columns in your `DataTable` and any configured `SqlType` overrides.
+
+## **Important design consideration**
+
+This implementation creates the database structure only. It does not insert the SQLite records.
+
+Also, because the example uses SQL Server-generated identity values, the later data-import stage must maintain a mapping between the original SQLite IDs and the newly generated SQL Server IDs. Otherwise, child records could reference the wrong parent records.
+
+The overall workflow should be:
+
+1. Load SQLite tables into your existing `DataSet`.
+2. Create SQL Server tables and constraints using this implementation.
+3. Import parent records and capture generated identity mappings.
+4. Import child records, translating their foreign keys using those mappings.
+
+This keeps table creation separate from data importing, which is the cleaner architecture for your `DataAggregator` application.
