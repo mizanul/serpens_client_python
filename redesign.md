@@ -1,3 +1,229 @@
+
+
+
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using Microsoft.Data.SqlClient;
+
+namespace DataAggregator
+{
+    public class SqlServerDataImporter
+    {
+        private readonly string _connectionString;
+
+        public SqlServerDataImporter(string connectionString)
+        {
+            _connectionString = connectionString;
+        }
+
+        public void ImportAll(
+            AggregatorConfig config,
+            DataSet sourceData,
+            int? sharedTestRunId = null)
+        {
+            using (var connection =
+                new SqlConnection(_connectionString))
+            {
+                connection.Open();
+
+                using (var transaction =
+                    connection.BeginTransaction())
+                {
+                    try
+                    {
+                        // Process parent tables before child tables.
+                        var orderedTables =
+                            config.GetTablesInDependencyOrder();
+
+                        foreach (TableDefinition definition in orderedTables)
+                        {
+                            if (!sourceData.Tables.Contains(
+                                definition.SourceTable))
+                            {
+                                throw new InvalidOperationException(
+                                    $"Source table '{definition.SourceTable}' " +
+                                    "does not exist in the DataSet.");
+                            }
+
+                            DataTable source =
+                                sourceData.Tables[definition.SourceTable];
+
+                            ImportTable(
+                                connection,
+                                transaction,
+                                definition,
+                                source,
+                                sharedTestRunId);
+                        }
+
+                        transaction.Commit();
+                    }
+                    catch
+                    {
+                        transaction.Rollback();
+                        throw;
+                    }
+                }
+            }
+        }
+
+        private void ImportTable(
+            SqlConnection connection,
+            SqlTransaction transaction,
+            TableDefinition definition,
+            DataTable source,
+            int? sharedTestRunId)
+        {
+            DataTable destinationData = new DataTable();
+
+            // Include only columns that should be explicitly inserted.
+            foreach (ColumnMapping mapping in definition.Columns)
+            {
+                if (!source.Columns.Contains(mapping.Source))
+                    throw new InvalidOperationException(
+                        $"Source column '{mapping.Source}' " +
+                        $"not found in '{source.TableName}'.");
+
+                string destinationName =
+                    string.IsNullOrWhiteSpace(mapping.Destination)
+                        ? mapping.Source
+                        : mapping.Destination;
+
+                destinationData.Columns.Add(
+                    destinationName,
+                    source.Columns[mapping.Source].DataType);
+            }
+
+            // Add generated columns that are not identity columns.
+            foreach (GeneratedColumn generated
+                     in definition.GeneratedColumns)
+            {
+                if (generated.Type == GeneratedColumnType.Identity)
+                    continue;
+
+                if (generated.Type == GeneratedColumnType.Default)
+                    continue;
+
+                if (generated.Type == GeneratedColumnType.SharedValue)
+                {
+                    if (sharedTestRunId == null)
+                        throw new InvalidOperationException(
+                            $"Shared TestRunID is required for " +
+                            $"table '{definition.Name}'.");
+
+                    if (!destinationData.Columns.Contains(generated.Name))
+                    {
+                        destinationData.Columns.Add(
+                            generated.Name, typeof(int));
+                    }
+                }
+            }
+
+            foreach (DataRow sourceRow in source.Rows)
+            {
+                DataRow destinationRow =
+                    destinationData.NewRow();
+
+                foreach (ColumnMapping mapping in definition.Columns)
+                {
+                    string destinationName =
+                        string.IsNullOrWhiteSpace(mapping.Destination)
+                            ? mapping.Source
+                            : mapping.Destination;
+
+                    destinationRow[destinationName] =
+                        sourceRow[mapping.Source] ?? DBNull.Value;
+                }
+
+                foreach (GeneratedColumn generated
+                         in definition.GeneratedColumns)
+                {
+                    if (generated.Type ==
+                        GeneratedColumnType.SharedValue)
+                    {
+                        destinationRow[generated.Name] =
+                            sharedTestRunId.Value;
+                    }
+                }
+
+                destinationData.Rows.Add(destinationRow);
+            }
+
+            if (destinationData.Rows.Count == 0)
+                return;
+
+            string schema = string.IsNullOrWhiteSpace(definition.Schema)
+                ? "dbo"
+                : definition.Schema;
+
+            string destinationTable =
+                GetDestinationTableName(definition);
+
+            using (var bulkCopy = new SqlBulkCopy(
+                connection,
+                SqlBulkCopyOptions.CheckConstraints,
+                transaction))
+            {
+                bulkCopy.DestinationTableName =
+                    $"[{schema}].[{destinationTable}]";
+
+                bulkCopy.BatchSize = 1000;
+                bulkCopy.BulkCopyTimeout = 0;
+
+                foreach (DataColumn column in destinationData.Columns)
+                {
+                    bulkCopy.ColumnMappings.Add(
+                        column.ColumnName,
+                        column.ColumnName);
+                }
+
+                bulkCopy.WriteToServer(destinationData);
+            }
+        }
+
+        private string GetDestinationTableName(
+            TableDefinition definition)
+        {
+            if (definition.DestinationTable.Contains("."))
+            {
+                string[] parts =
+                    definition.DestinationTable.Split('.');
+
+                if (parts.Length != 2)
+                    throw new InvalidOperationException(
+                        $"Invalid destination table: " +
+                        definition.DestinationTable);
+
+                return parts[1];
+            }
+
+            return definition.DestinationTable;
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I recommend updating your existing classes rather than creating a separate configuration model. Your current design is already a good foundation for a metadata-driven database importer.
 
 I would make the following changes:
