@@ -1,32 +1,57 @@
-Below is a complete, generic C# implementation that reads your XML table definition, creates the SQL Server table, and imports data from SQLite.
+I recommend updating your existing classes rather than creating a separate configuration model. Your current design is already a good foundation for a metadata-driven database importer.
 
-It supports:
+I would make the following changes:
 
-- `IDENTITY(1,1)` for SQL Server-generated primary keys.
-- Composite primary keys.
-- Composite unique constraints.
-- Foreign keys using `parent` and `JoinConditions`.
-- XML source-to-destination column mapping.
-- Duplicate prevention during insertion.
-- SQL transactions.
-- Reusable methods for other tables, not just MOSS.
+1. **Identity:** Add an `Identity` property. When enabled, the primary key column becomes `IDENTITY(1,1)`.
+2. **Primary key:** Support both single-column and composite primary keys.
+3. **Multiple unique keys:** Replace the single `UniqueKey` string with `List<UniqueKeyDefinition>`.
+4. **Optional parent:** Root and Property tables can exist without a parent.
+5. **Foreign key:** Generate the relationship from `Parent` and `JoinConditions`.
+6. **Dependency ordering:** Keep your existing parent-first ordering and circular-dependency detection.
+7. **Validation:** Validate identity, keys, columns, and parent relationships before importing.
 
-**Important design decision:** When `identity="true"`, SQL Server generates the destination ID. The SQLite ID is not copied. Other columns, including foreign-key columns, are imported normally.
+## **1. Recommended XML configuration**
 
-## **1. XML configuration**
+For a table without a parent:
 
-I recommend this small adjustment to your existing XML:
+```
+<Table
+    name="TestRunProperty"
+    type="Property"
+    sourceTable="TestRunProperty"
+    destinationTable="TestRunProperty"
+    primaryKey="PropertyID"
+    identity="true">
+
+    <UniqueKeys>
+        <UniqueKey columns="PropertyID,TestRunID" />
+        <UniqueKey columns="PropertyName,TestRunID" />
+    </UniqueKeys>
+
+    <Columns>
+        <Column source="PropertyID" />
+        <Column source="TestRunID" />
+        <Column source="PropertyName" />
+    </Columns>
+</Table>
+```
+
+For a table with a parent:
 
 ```
 <Table
     name="MOSS"
-    type="Root"
+    type="Child"
     sourceTable="MOSS_table"
     destinationTable="SDA_MOSS"
     parent="TestRunProperty"
     primaryKey="MOSS_ID"
-    identity="true"
-    uniqueKey="MOSS_ID,TestRunID">
+    identity="true">
+
+    <UniqueKeys>
+        <UniqueKey columns="PropertyID,TestRunID" />
+        <UniqueKey columns="MOSS_Name,TestRunID" />
+    </UniqueKeys>
 
     <JoinConditions operator="AND">
         <Condition
@@ -42,417 +67,675 @@ I recommend this small adjustment to your existing XML:
         <Column source="MOSS_ID" />
         <Column source="PropertyID" />
         <Column source="TestRunID" />
-        <Column source="MOSS_Name" destination="MOSS_Name" />
+        <Column source="MOSS_Name" />
     </Columns>
 </Table>
 ```
 
-## **2. Complete C# implementation**
+Notice that `UniqueKeys` can contain as many unique constraints as needed.
 
-Create a class named `SQLiteToSqlServerImporter.cs`.
+## **2. Complete updated TableDefinition classes**
+
+Replace your existing configuration classes with the following.
 
 ```
 using System;
 using System.Collections.Generic;
-using System.Data;
-using System.Data.SQLite;
+using System.IO;
 using System.Linq;
 using System.Xml.Linq;
-using Microsoft.Data.SqlClient;
 
-public class SQLiteToSqlServerImporter
+namespace DataAggregator
 {
-    // ============================================
-    // MAIN IMPORT METHOD
-    // ============================================
-
-    public void ImportTable(
-        SQLiteConnection sqliteConnection,
-        SqlConnection sqlConnection,
-        XElement tableConfig,
-        XDocument fullConfig)
+    public enum TableType
     {
-        // 1. Create destination table
-        CreateDestinationTable(
-            sqlConnection,
-            tableConfig,
-            fullConfig);
-
-        // 2. Insert SQLite data
-        InsertTableData(
-            sqliteConnection,
-            sqlConnection,
-            tableConfig);
+        Property,
+        Root,
+        Child
     }
 
-
-    // ============================================
-    // CREATE SQL SERVER TABLE
-    // ============================================
-
-    public void CreateDestinationTable(
-        SqlConnection connection,
-        XElement tableConfig,
-        XDocument fullConfig)
+    public class AggregatorConfig
     {
-        string tableName =
-            (string)tableConfig.Attribute("destinationTable");
+        public List<TableDefinition> Tables { get; set; }
+            = new List<TableDefinition>();
 
-        string primaryKey =
-            (string)tableConfig.Attribute("primaryKey");
+        // =========================================
+        // LOAD CONFIGURATION
+        // =========================================
 
-        string uniqueKey =
-            (string)tableConfig.Attribute("uniqueKey");
-
-        string parentName =
-            (string)tableConfig.Attribute("parent");
-
-        bool identity =
-            string.Equals(
-                (string)tableConfig.Attribute("identity"),
-                "true",
-                StringComparison.OrdinalIgnoreCase);
-
-        var columns = tableConfig
-            .Element("Columns")
-            .Elements("Column")
-            .Select(c => new
+        public static AggregatorConfig Load(string configPath)
+        {
+            if (!File.Exists(configPath))
             {
-                Source = (string)c.Attribute("source"),
-                Destination =
-                    (string)c.Attribute("destination")
-                    ?? (string)c.Attribute("source"),
-
-                SqlType =
-                    (string)c.Attribute("sqlType")
-                    ?? "NVARCHAR(255)"
-            })
-            .ToList();
-
-        var definitions = new List<string>();
-
-        // Column definitions
-        foreach (var column in columns)
-        {
-            bool isIdentity =
-                identity && column.Destination == primaryKey;
-
-            string definition = isIdentity
-                ? $"[{column.Destination}] INT IDENTITY(1,1) NOT NULL"
-                : $"[{column.Destination}] {column.SqlType} NULL";
-
-            definitions.Add(definition);
-        }
-
-        // Primary key
-        if (!string.IsNullOrWhiteSpace(primaryKey))
-        {
-            var pkColumns = primaryKey.Split(',')
-                .Select(c => $"[{c.Trim()}]");
-
-            definitions.Add(
-                $"CONSTRAINT [PK_{tableName}] " +
-                $"PRIMARY KEY ({string.Join(", ", pkColumns)})");
-        }
-
-        // Unique key
-        if (!string.IsNullOrWhiteSpace(uniqueKey))
-        {
-            var uqColumns = uniqueKey.Split(',')
-                .Select(c => $"[{c.Trim()}]");
-
-            definitions.Add(
-                $"CONSTRAINT [UQ_{tableName}] " +
-                $"UNIQUE ({string.Join(", ", uqColumns)})");
-        }
-
-        // Foreign key
-        if (!string.IsNullOrWhiteSpace(parentName))
-        {
-            // Find parent XML configuration
-            var parentConfig = fullConfig
-                .Descendants("Table")
-                .FirstOrDefault(t =>
-                    (string)t.Attribute("name") == parentName);
-
-            if (parentConfig == null)
-                throw new Exception(
-                    $"Parent configuration not found: {parentName}");
-
-            string parentTable =
-                (string)parentConfig.Attribute("destinationTable");
-
-            var conditions = tableConfig
-                .Element("JoinConditions")
-                ?.Elements("Condition")
-                .ToList();
-
-            if (conditions == null || !conditions.Any())
-                throw new Exception(
-                    $"JoinConditions missing for {tableName}");
-
-            string childColumns = string.Join(", ",
-                conditions.Select(c =>
-                    $"[{(string)c.Attribute("childColumn")}]"));
-
-            string parentColumns = string.Join(", ",
-                conditions.Select(c =>
-                    $"[{(string)c.Attribute("parentColumn")}]"));
-
-            definitions.Add($@"
-                CONSTRAINT [FK_{tableName}_{parentTable}]
-                FOREIGN KEY ({childColumns})
-                REFERENCES [{parentTable}] ({parentColumns})");
-        }
-
-        string sql = $@"
-            IF OBJECT_ID(N'dbo.{tableName}', N'U') IS NULL
-            BEGIN
-                CREATE TABLE [dbo].[{tableName}]
-                (
-                    {string.Join("," + Environment.NewLine, definitions)}
-                );
-            END";
-
-        using var command = new SqlCommand(sql, connection);
-        command.ExecuteNonQuery();
-    }
-
-
-    // ============================================
-    // INSERT SQLITE DATA INTO SQL SERVER
-    // ============================================
-
-    public void InsertTableData(
-        SQLiteConnection sqliteConnection,
-        SqlConnection sqlConnection,
-        XElement tableConfig)
-    {
-        string sourceTable =
-            (string)tableConfig.Attribute("sourceTable");
-
-        string destinationTable =
-            (string)tableConfig.Attribute("destinationTable");
-
-        string primaryKey =
-            (string)tableConfig.Attribute("primaryKey");
-
-        string uniqueKey =
-            (string)tableConfig.Attribute("uniqueKey");
-
-        bool identity =
-            string.Equals(
-                (string)tableConfig.Attribute("identity"),
-                "true",
-                StringComparison.OrdinalIgnoreCase);
-
-        var columns = tableConfig
-            .Element("Columns")
-            .Elements("Column")
-            .Select(c => new
-            {
-                Source = (string)c.Attribute("source"),
-                Destination =
-                    (string)c.Attribute("destination")
-                    ?? (string)c.Attribute("source")
-            })
-            // Do not insert SQL Server-generated identity
-            .Where(c =>
-                !(identity && c.Destination == primaryKey))
-            .ToList();
-
-        if (!columns.Any())
-            throw new Exception("No columns available for insertion.");
-
-        // Destination columns
-        string destinationColumns = string.Join(", ",
-            columns.Select(c => $"[{c.Destination}]"));
-
-        // SQL parameters
-        string parameters = string.Join(", ",
-            columns.Select((c, i) => $"@p{i}"));
-
-        // SQLite SELECT
-        string selectSql = $@"
-            SELECT {string.Join(", ",
-                columns.Select(c => $"[{c.Source}]"))}
-            FROM [{sourceTable}]";
-
-        // Duplicate prevention
-        string duplicateCondition = "";
-
-        if (!string.IsNullOrWhiteSpace(uniqueKey))
-        {
-            var uniqueColumns = uniqueKey.Split(',')
-                .Select(c => c.Trim())
-                .ToList();
-
-            var conditions = new List<string>();
-
-            foreach (string uniqueColumn in uniqueColumns)
-            {
-                int index = columns.FindIndex(
-                    c => c.Destination == uniqueColumn);
-
-                // Identity columns are generated by SQL Server.
-                if (index < 0)
-                    continue;
-
-                conditions.Add($@"
-                    (
-                        T.[{uniqueColumn}] = @p{index}
-                        OR
-                        (T.[{uniqueColumn}] IS NULL AND @p{index} IS NULL)
-                    )");
+                throw new FileNotFoundException(
+                    "Aggregator configuration was not found.",
+                    configPath);
             }
 
-            if (conditions.Any())
+            XDocument document = XDocument.Load(configPath);
+
+            XElement aggregatorElement =
+                document.Root?.Element("aggregator");
+
+            if (aggregatorElement == null)
             {
-                duplicateCondition =
-                    "WHERE NOT EXISTS (" +
-                    $"SELECT 1 FROM [dbo].[{destinationTable}] T " +
-                    $"WHERE {string.Join(" AND ", conditions)})";
+                throw new InvalidOperationException(
+                    "Missing <aggregator> configuration section.");
             }
+
+            XElement tablesElement =
+                aggregatorElement.Element("Tables");
+
+            if (tablesElement == null)
+            {
+                throw new InvalidOperationException(
+                    "Missing <Tables> element.");
+            }
+
+            var config = new AggregatorConfig();
+
+            foreach (XElement element in tablesElement.Elements("Table"))
+            {
+                config.Tables.Add(ParseTable(element));
+            }
+
+            config.Validate();
+
+            return config;
         }
 
-        string insertSql = $@"
-            INSERT INTO [dbo].[{destinationTable}]
-            (
-                {destinationColumns}
-            )
-            SELECT {parameters}
-            {duplicateCondition};";
+        // =========================================
+        // PARSE TABLE
+        // =========================================
 
-        using var readerCommand =
-            new SQLiteCommand(selectSql, sqliteConnection);
-
-        using var reader = readerCommand.ExecuteReader();
-
-        using var transaction = sqlConnection.BeginTransaction();
-
-        try
+        private static TableDefinition ParseTable(XElement element)
         {
-            using var insertCommand =
-                new SqlCommand(
-                    insertSql,
-                    sqlConnection,
-                    transaction);
+            string typeValue = RequiredAttribute(element, "type");
 
-            // Create parameters once
-            for (int i = 0; i < columns.Count; i++)
+            if (!Enum.TryParse(
+                typeValue,
+                true,
+                out TableType tableType))
             {
-                insertCommand.Parameters.Add(
-                    new SqlParameter($"@p{i}", SqlDbType.Variant));
+                throw new InvalidOperationException(
+                    $"Invalid table type '{typeValue}'.");
             }
 
-            // Read and insert each SQLite record
-            while (reader.Read())
+            var table = new TableDefinition
             {
-                for (int i = 0; i < columns.Count; i++)
+                Name = RequiredAttribute(element, "name"),
+
+                Type = tableType,
+
+                SourceTable =
+                    RequiredAttribute(element, "sourceTable"),
+
+                DestinationTable =
+                    RequiredAttribute(element, "destinationTable"),
+
+                Parent = (string)element.Attribute("parent"),
+
+                PrimaryKey = ParseColumns(
+                    (string)element.Attribute("primaryKey")),
+
+                Identity = ParseBooleanAttribute(
+                    element, "identity", false),
+
+                JoinOperator = "AND"
+            };
+
+            // -------------------------------------
+            // UNIQUE KEYS
+            // -------------------------------------
+
+            XElement uniqueKeysElement =
+                element.Element("UniqueKeys");
+
+            if (uniqueKeysElement != null)
+            {
+                foreach (XElement uniqueElement
+                    in uniqueKeysElement.Elements("UniqueKey"))
                 {
-                    insertCommand.Parameters[$"@p{i}"].Value =
-                        reader.IsDBNull(i)
-                            ? DBNull.Value
-                            : reader.GetValue(i);
+                    string columns =
+                        RequiredAttribute(uniqueElement, "columns");
+
+                    table.UniqueKeys.Add(new UniqueKeyDefinition
+                    {
+                        Columns = ParseColumns(columns)
+                    });
+                }
+            }
+
+            // Backward compatibility with old XML:
+            // uniqueKey="Column1,Column2"
+            string legacyUniqueKey =
+                (string)element.Attribute("uniqueKey");
+
+            if (!string.IsNullOrWhiteSpace(legacyUniqueKey))
+            {
+                table.UniqueKeys.Add(new UniqueKeyDefinition
+                {
+                    Columns = ParseColumns(legacyUniqueKey)
+                });
+            }
+
+            // -------------------------------------
+            // JOIN CONDITIONS / FOREIGN KEY
+            // -------------------------------------
+
+            XElement joinElement =
+                element.Element("JoinConditions");
+
+            if (joinElement != null)
+            {
+                table.JoinOperator =
+                    ((string)joinElement.Attribute("operator") ?? "AND")
+                    .ToUpperInvariant();
+
+                foreach (XElement condition
+                    in joinElement.Elements("Condition"))
+                {
+                    table.JoinConditions.Add(new JoinCondition
+                    {
+                        ParentColumn = RequiredAttribute(
+                            condition, "parentColumn"),
+
+                        ChildColumn = RequiredAttribute(
+                            condition, "childColumn")
+                    });
+                }
+            }
+
+            // -------------------------------------
+            // COLUMN MAPPINGS
+            // -------------------------------------
+
+            XElement columnsElement = element.Element("Columns");
+
+            if (columnsElement != null)
+            {
+                foreach (XElement column
+                    in columnsElement.Elements("Column"))
+                {
+                    string source =
+                        RequiredAttribute(column, "source");
+
+                    table.Columns.Add(new ColumnMapping
+                    {
+                        Source = source,
+
+                        Destination =
+                            (string)column.Attribute("destination")
+                            ?? source
+                    });
+                }
+            }
+
+            return table;
+        }
+
+        // =========================================
+        // HELPER METHODS
+        // =========================================
+
+        private static string RequiredAttribute(
+            XElement element,
+            string attributeName)
+        {
+            string value =
+                (string)element.Attribute(attributeName);
+
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new InvalidOperationException(
+                    $"Element <{element.Name}> requires attribute " +
+                    $"'{attributeName}'.");
+            }
+
+            return value.Trim();
+        }
+
+        private static bool ParseBooleanAttribute(
+            XElement element,
+            string attributeName,
+            bool defaultValue)
+        {
+            string value = (string)element.Attribute(attributeName);
+
+            if (string.IsNullOrWhiteSpace(value))
+                return defaultValue;
+
+            if (!bool.TryParse(value, out bool result))
+            {
+                throw new InvalidOperationException(
+                    $"Invalid Boolean value '{value}' for " +
+                    $"attribute '{attributeName}'.");
+            }
+
+            return result;
+        }
+
+        private static List<string> ParseColumns(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return new List<string>();
+
+            return value.Split(',')
+                .Select(c => c.Trim())
+                .Where(c => !string.IsNullOrWhiteSpace(c))
+                .ToList();
+        }
+
+        // =========================================
+        // VALIDATE CONFIGURATION
+        // =========================================
+
+        public void Validate()
+        {
+            var names = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+
+            // First pass: individual table validation
+            foreach (var table in Tables)
+            {
+                if (!names.Add(table.Name))
+                {
+                    throw new InvalidOperationException(
+                        $"Duplicate table definition: {table.Name}");
                 }
 
-                insertCommand.ExecuteNonQuery();
+                if (!Enum.IsDefined(typeof(TableType), table.Type))
+                {
+                    throw new InvalidOperationException(
+                        $"Invalid table type for '{table.Name}'.");
+                }
+
+                if (table.Type == TableType.Child &&
+                    string.IsNullOrWhiteSpace(table.Parent))
+                {
+                    throw new InvalidOperationException(
+                        $"Child table '{table.Name}' must define a parent.");
+                }
+
+                if (table.JoinOperator != "AND" &&
+                    table.JoinOperator != "OR")
+                {
+                    throw new InvalidOperationException(
+                        $"Invalid JoinConditions operator for " +
+                        $"'{table.Name}'.");
+                }
+
+                if (table.Columns.Count == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Table '{table.Name}' has no column mappings.");
+                }
+
+                // Destination column names must be unique
+                var destinationColumns = new HashSet<string>(
+                    StringComparer.OrdinalIgnoreCase);
+
+                foreach (var column in table.Columns)
+                {
+                    if (!destinationColumns.Add(column.Destination))
+                    {
+                        throw new InvalidOperationException(
+                            $"Duplicate destination column " +
+                            $"'{column.Destination}' in '{table.Name}'.");
+                    }
+                }
+
+                // Primary key validation
+                ValidateKeyColumns(
+                    table,
+                    table.PrimaryKey,
+                    "Primary key");
+
+                // Identity validation
+                if (table.Identity)
+                {
+                    if (table.PrimaryKey.Count != 1)
+                    {
+                        throw new InvalidOperationException(
+                            $"Identity table '{table.Name}' must have " +
+                            "exactly one primary key column.");
+                    }
+                }
+
+                // Unique key validation
+                foreach (var uniqueKey in table.UniqueKeys)
+                {
+                    ValidateKeyColumns(
+                        table,
+                        uniqueKey.Columns,
+                        "Unique key");
+                }
+
+                // Parent and foreign key validation
+                if (table.JoinConditions.Count > 0 &&
+                    string.IsNullOrWhiteSpace(table.Parent))
+                {
+                    throw new InvalidOperationException(
+                        $"Table '{table.Name}' defines JoinConditions " +
+                        "but has no parent.");
+                }
+
+                if (!string.IsNullOrWhiteSpace(table.Parent) &&
+                    table.JoinConditions.Count == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Table '{table.Name}' defines a parent but " +
+                        "has no JoinConditions.");
+                }
+
+                if (table.JoinConditions.Count > 0 &&
+                    table.JoinOperator != "AND")
+                {
+                    throw new InvalidOperationException(
+                        $"Foreign key for '{table.Name}' must use " +
+                        "AND conditions. SQL Server foreign keys " +
+                        "do not support OR relationships.");
+                }
+
+                foreach (var condition in table.JoinConditions)
+                {
+                    if (!destinationColumns.Contains(
+                        condition.ChildColumn))
+                    {
+                        throw new InvalidOperationException(
+                            $"Foreign key child column " +
+                            $"'{condition.ChildColumn}' does not exist " +
+                            $"in '{table.Name}'.");
+                    }
+                }
             }
 
-            transaction.Commit();
+            // Second pass: validate parent relationships
+            foreach (var table in Tables)
+            {
+                if (string.IsNullOrWhiteSpace(table.Parent))
+                    continue;
+
+                TableDefinition parent = Tables.FirstOrDefault(
+                    x => x.Name.Equals(
+                        table.Parent,
+                        StringComparison.OrdinalIgnoreCase));
+
+                if (parent == null)
+                {
+                    throw new InvalidOperationException(
+                        $"Parent '{table.Parent}' for table " +
+                        $"'{table.Name}' was not defined.");
+                }
+
+                foreach (var condition in table.JoinConditions)
+                {
+                    if (!parent.Columns.Any(c =>
+                        c.Destination.Equals(
+                            condition.ParentColumn,
+                            StringComparison.OrdinalIgnoreCase)))
+                    {
+                        throw new InvalidOperationException(
+                            $"Parent column '{condition.ParentColumn}' " +
+                            $"does not exist in '{parent.Name}'.");
+                    }
+                }
+
+                // SQL Server requires referenced parent columns
+                // to be a primary key or unique key.
+                var parentColumns = table.JoinConditions
+                    .Select(c => c.ParentColumn)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                bool validReference =
+                    SameKey(parent.PrimaryKey, parentColumns) ||
+                    parent.UniqueKeys.Any(u =>
+                        SameKey(u.Columns, parentColumns));
+
+                if (!validReference)
+                {
+                    throw new InvalidOperationException(
+                        $"Foreign key for '{table.Name}' references " +
+                        $"columns in '{parent.Name}' that are not " +
+                        "a primary key or unique key.");
+                }
+            }
         }
-        catch
+
+        private static void ValidateKeyColumns(
+            TableDefinition table,
+            List<string> keyColumns,
+            string keyType)
         {
-            transaction.Rollback();
-            throw;
+            if (keyColumns == null || keyColumns.Count == 0)
+                return;
+
+            if (keyColumns.Distinct(
+                StringComparer.OrdinalIgnoreCase).Count()
+                != keyColumns.Count)
+            {
+                throw new InvalidOperationException(
+                    $"Duplicate columns in {keyType} of '{table.Name}'.");
+            }
+
+            foreach (string keyColumn in keyColumns)
+            {
+                if (!table.Columns.Any(c =>
+                    c.Destination.Equals(
+                        keyColumn,
+                        StringComparison.OrdinalIgnoreCase)))
+                {
+                    throw new InvalidOperationException(
+                        $"{keyType} column '{keyColumn}' " +
+                        $"does not exist in '{table.Name}'.");
+                }
+            }
         }
+
+        private static bool SameKey(
+            IEnumerable<string> first,
+            IEnumerable<string> second)
+        {
+            var firstSet = new HashSet<string>(
+                first,
+                StringComparer.OrdinalIgnoreCase);
+
+            var secondSet = new HashSet<string>(
+                second,
+                StringComparer.OrdinalIgnoreCase);
+
+            return firstSet.SetEquals(secondSet);
+        }
+
+        // =========================================
+        // TABLE DEPENDENCY ORDER
+        // =========================================
+
+        public List<TableDefinition> GetTablesInDependencyOrder()
+        {
+            var ordered = new List<TableDefinition>();
+
+            var visited = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+
+            var visiting = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var table in Tables)
+            {
+                Visit(table, visited, visiting, ordered);
+            }
+
+            return ordered;
+        }
+
+        private void Visit(
+            TableDefinition table,
+            HashSet<string> visited,
+            HashSet<string> visiting,
+            List<TableDefinition> ordered)
+        {
+            if (visited.Contains(table.Name))
+                return;
+
+            if (!visiting.Add(table.Name))
+            {
+                throw new InvalidOperationException(
+                    $"Circular table dependency detected at " +
+                    $"'{table.Name}'.");
+            }
+
+            if (!string.IsNullOrWhiteSpace(table.Parent))
+            {
+                TableDefinition parent = Tables.First(
+                    x => x.Name.Equals(
+                        table.Parent,
+                        StringComparison.OrdinalIgnoreCase));
+
+                Visit(parent, visited, visiting, ordered);
+            }
+
+            visiting.Remove(table.Name);
+            visited.Add(table.Name);
+            ordered.Add(table);
+        }
+    }
+
+    // =============================================
+    // TABLE DEFINITION
+    // =============================================
+
+    public class TableDefinition
+    {
+        public string Name { get; set; }
+
+        public TableType Type { get; set; }
+
+        public string SourceTable { get; set; }
+
+        public string DestinationTable { get; set; }
+
+        public string Parent { get; set; }
+
+        // Supports single or composite primary keys
+        public List<string> PrimaryKey { get; set; }
+            = new List<string>();
+
+        // SQL Server IDENTITY(1,1)
+        public bool Identity { get; set; }
+
+        // Supports multiple unique constraints
+        public List<UniqueKeyDefinition> UniqueKeys { get; set; }
+            = new List<UniqueKeyDefinition>();
+
+        public string JoinOperator { get; set; } = "AND";
+
+        // Parent-child relationship
+        public List<JoinCondition> JoinConditions { get; set; }
+            = new List<JoinCondition>();
+
+        // Source-to-destination column mappings
+        public List<ColumnMapping> Columns { get; set; }
+            = new List<ColumnMapping>();
+    }
+
+    // =============================================
+    // UNIQUE KEY DEFINITION
+    // =============================================
+
+    public class UniqueKeyDefinition
+    {
+        public List<string> Columns { get; set; }
+            = new List<string>();
+    }
+
+    // =============================================
+    // FOREIGN KEY / JOIN CONDITION
+    // =============================================
+
+    public class JoinCondition
+    {
+        public string ParentColumn { get; set; }
+
+        public string ChildColumn { get; set; }
+    }
+
+    // =============================================
+    // COLUMN MAPPING
+    // =============================================
+
+    public class ColumnMapping
+    {
+        public string Source { get; set; }
+
+        public string Destination { get; set; }
     }
 }
 ```
 
-## **3. Important correction for the MOSS unique key**
+## **3. Important implementation notes**
 
-Because SQL Server generates `MOSS_ID`, your original:
+There are three things to consider when connecting this configuration class to your table creation and data import methods.
 
-```
-uniqueKey="MOSS_ID,TestRunID"
-```
+**A. Identity and source IDs**
 
-does not provide meaningful duplicate prevention when `MOSS_ID` is an identity column.
+When `Identity = true`, SQL Server generates a new primary key. Your importer must not insert the SQLite primary key value.
 
-If `PropertyID` and `TestRunID` identify a MOSS record, change it to:
+For example:
 
-```
-uniqueKey="PropertyID,TestRunID"
-```
+| SQLite MOSS_ID | SQL Server MOSS_ID |
+| -------------- | ------------------ |
+| 101            | 1                  |
+| 102            | 2                  |
+| 103            | 3                  |
 
-If you need to preserve the original SQLite `MOSS_ID`, set `identity="false"` instead.
+**B. Foreign keys and identity mapping**
 
-## **4. Add SQL data types to XML**
+This is particularly important for your parent-child tables.
 
-For proper foreign-key compatibility, specify the SQL types explicitly. For example:
+If `TestRunProperty.PropertyID` is generated by SQL Server, the child table cannot simply copy the original SQLite `PropertyID`.
 
-```
-<Columns>
-    <Column source="MOSS_ID" sqlType="INT" />
-    <Column source="PropertyID" sqlType="INT" />
-    <Column source="TestRunID" sqlType="INT" />
-    <Column source="MOSS_Name" sqlType="NVARCHAR(255)" />
-</Columns>
-```
-
-Use matching types for `PropertyID` and `TestRunID` in the parent `TestRunProperty` table.
-
-## **5. How to execute**
+You will need an ID mapping between SQLite and SQL Server:
 
 ```
-XDocument config = XDocument.Load("App.config");
+SQLite Parent ID  →  SQL Server Parent ID
 
-var tables = config.Descendants("Table");
-
-using var sqliteConnection =
-    new SQLiteConnection(sqliteConnectionString);
-
-using var sqlConnection =
-    new SqlConnection(sqlConnectionString);
-
-sqliteConnection.Open();
-sqlConnection.Open();
-
-var importer = new SQLiteToSqlServerImporter();
-
-foreach (var table in tables)
-{
-    importer.ImportTable(
-        sqliteConnection,
-        sqlConnection,
-        table,
-        config);
-}
+101               →  1
+102               →  2
+103               →  3
 ```
 
-**Important:** Make sure the parent table (`TestRunProperty`) is created and populated before importing `MOSS`. Its `(PropertyID, TestRunID)` columns must have a matching unique constraint or primary key.
+Your importer must use this mapping when inserting child records. Otherwise, the foreign key will fail.
 
-Also, in the insertion method, use `AddWithValue` for each row's parameters rather than declaring every parameter as `SqlDbType.Variant`. This allows SQL Server to receive the actual .NET value types.
+**C. Foreign key constraints**
 
-## **6. Expected architecture**
+SQL Server requires the referenced parent columns to have a primary key or unique constraint. The order of the referenced columns must also match the corresponding candidate key definition.
 
-**App.config XML**
+For example:
 
-Table definitions, keys, relationships, column mappings
+```
+UNIQUE (PropertyID, TestRunID)
+```
 
-**SQLiteToSqlServerImporter**
+should be referenced as:
 
-**CreateDestinationTable()**
+```
+FOREIGN KEY (PropertyID, TestRunID)
+REFERENCES TestRunProperty (PropertyID, TestRunID)
+```
 
-Columns, IDENTITY, PK, UNIQUE, FK
+## **4. Final architecture recommendation**
 
-**InsertTableData()**
+Keep responsibilities separated:
 
-Read SQLite, map columns, insert records
+| Class                 | Responsibility                             |
+| --------------------- | ------------------------------------------ |
+| `AggregatorConfig`    | Load and validate XML                      |
+| `TableDefinition`     | Store table metadata                       |
+| `UniqueKeyDefinition` | Store multiple unique constraints          |
+| `JoinCondition`       | Define foreign-key relationships           |
+| `ColumnMapping`       | Map SQLite to SQL Server columns           |
+| `TableCreator`        | Generate SQL Server tables and constraints |
+| `DataImporter`        | Import data and handle identity mapping    |
 
-**SQL Server**
-
-Destination tables with constraints and imported data
-
-This gives you one generic importer for `MOSS`, `TestRunProperty`, and your other configured tables. You won't need a separate C# method for every table.
+One important distinction: the code above updates your configuration model and validation. It does not yet implement the SQL Server table creation or the parent identity mapping. Those belong in `TableCreator` and `DataImporter`, respectively.
