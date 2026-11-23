@@ -2038,3 +2038,16 @@ The overall workflow should be:
 4. Import child records, translating their foreign keys using those mappings.
 
 This keeps table creation separate from data importing, which is the cleaner architecture for your `DataAggregator` application.
+
+
+
+
+---
+
+1. I have successfully implemented the creation of TestRun tables and their associated child tables using the template-based table definitions. The process preserves the relationships between tables, including primary keys, unique keys, foreign keys, and indexes. This approach allows us to dynamically create SQL Server tables from SQLite table definitions without having to manually define each table.
+
+2. I am currently implementing the data insertion process, ensuring that data is transferred while maintaining the relationships and join conditions between tables.
+
+3. I am using TestRunID as the primary key of the top-level parent table. This key will propagate through all related child tables, maintaining referential integrity across the entire table hierarchy. Each table will have a combined key structure that incorporates TestRunID along with its own primary key. This will also be reflected in the unique key definitions to ensure that records remain uniquely identifiable within each test run.
+
+Overall, the goal is to build a flexible, metadata-driven migration process that can automatically create the SQL Server table structure and transfer data from SQLite while preserving the complete relational structure and data integrity.
